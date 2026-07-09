@@ -1,0 +1,83 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  lint-and-unit:
+    name: Lint & unit tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Install just
+        uses: extractions/setup-just@v2
+
+      - name: Install dependencies
+        run: just install
+
+      - name: Lint
+        run: just lint
+
+      - name: Unit tests
+        run: just test
+
+      - name: Collect integration tests
+        run: just collect-integration
+
+      - name: Upload coverage
+        if: matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.python-version }}
+          path: .coverage
+          if-no-files-found: ignore
+
+  integration:
+    name: Integration tests (live Galaxy)
+    runs-on: ubuntu-latest
+    # Only run when the repo has the API key configured (skips on forks/PRs without secret).
+    if: ${{ vars.GALAXY_USER_API_KEY != '' }}
+    needs: lint-and-unit
+    env:
+      GALAXY_URL: ${{ vars.GALAXY_URL || 'https://usegalaxy.org' }}
+      GALAXY_USER_API_KEY: ${{ secrets.GALAXY_USER_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Install just
+        uses: extractions/setup-just@v2
+
+      - name: Install dependencies
+        run: just install
+
+      - name: Integration tests
+        run: just test-integration
