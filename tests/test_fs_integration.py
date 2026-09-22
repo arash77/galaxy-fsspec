@@ -61,7 +61,7 @@ def seeded_history(fs):
 
 def test_histories_listed(fs, seeded_history):
     fs._clear_cache()
-    names = fs.ls("histories")
+    names = fs.ls("histories", detail=False)
     assert any(n.endswith(seeded_history) or "galaxy-fsspec-test" in n for n in names), names
 
 
@@ -75,7 +75,9 @@ def test_history_contents_and_collection(fs, seeded_history):
     # Timestamps are fetched lazily via info(), not during ls().
     details = fs.info(ours["name"])
     assert details["created"] is not None
-    assert details["last_modified"] is not None
+    assert details["mtime"] is not None
+    assert fs.created(ours["name"]) is not None
+    assert fs.modified(ours["name"]) is not None
 
     children = fs.ls(ours["name"], detail=True)
     coll = next(c for c in children if c["type"] == "directory")
@@ -135,7 +137,7 @@ def library_with_file():
 
 def test_libraries_listed(fs):
     fs._clear_cache()
-    names = fs.ls("libraries")
+    names = fs.ls("libraries", detail=False)
     assert len(names) > 0
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import time
 import urllib.parse
 from collections.abc import Iterable
@@ -44,7 +45,7 @@ class GalaxyFileSystem(AbstractFileSystem):
                 └── <folder>/
                     └── ...
 
-    History folders expose ``created`` and ``last_modified`` timestamps via
+    History folders expose ``created`` and ``mtime`` timestamps via
     :meth:`info`. Set ``show_hid_in_names=True`` (or ``GALAXY_FSSPEC_SHOW_HID_IN_NAMES=true``)
     to prefix every entry with its Galaxy ``hid`` in the style ``1-my-dataset``.
     """
@@ -82,14 +83,15 @@ class GalaxyFileSystem(AbstractFileSystem):
     # Public fsspec API
     # ------------------------------------------------------------------ #
 
-    def ls(self, path: str, detail: bool = False, **kwargs: Any) -> list:
+    def ls(self, path: str, detail: bool = True, **kwargs: Any) -> list:
+        """List a directory. Returns entry dicts, or names with ``detail=False``."""
         entries = self._ls(path)
         if detail:
             return entries
         return [e["name"] for e in entries]
 
     def _ls(self, path: str) -> list[dict]:
-        path = self._strip(path)
+        path = self._strip_protocol(path)
         cached = self._cached_dir(path)
         if cached is not None:
             return cached
@@ -98,10 +100,29 @@ class GalaxyFileSystem(AbstractFileSystem):
         return entries
 
     def info(self, path: str, **kwargs: Any) -> dict:
-        return self._info(self._strip_protocol(path), **kwargs)
+        return self._info(path, **kwargs)
+
+    def created(self, path: str) -> dt.datetime:
+        """Return when the Galaxy object at ``path`` was created."""
+        return self._timestamp(path, "created")
+
+    def modified(self, path: str) -> dt.datetime:
+        """Return when the Galaxy object at ``path`` last changed."""
+        return self._timestamp(path, "mtime")
+
+    def _timestamp(self, path: str, key: str) -> dt.datetime:
+        value = self._info(path).get(key)
+        if not value:
+            raise GalaxyApiError(f"Galaxy reported no {key} for {path!r}")
+        try:
+            return dt.datetime.fromisoformat(str(value))
+        except ValueError as exc:
+            raise GalaxyApiError(
+                f"Galaxy reported an unparsable {key} for {path!r}: {value!r}"
+            ) from exc
 
     def _info(self, path: str, **kwargs: Any) -> dict:
-        path = self._strip(path)
+        path = self._strip_protocol(path)
         if path in self._info_cache:
             return self._info_cache[path]
         if path == ROOT:
@@ -122,7 +143,7 @@ class GalaxyFileSystem(AbstractFileSystem):
                 if parent == HISTORIES_DIR and entry.get("created") is None:
                     hist = self.gi.histories.show_history(entry["history_id"], contents=False)
                     entry["created"] = hist.get("create_time")
-                    entry["last_modified"] = hist.get("update_time")
+                    entry["mtime"] = hist.get("update_time")
                 return entry
         raise NotFoundError(path)
 
@@ -237,19 +258,27 @@ class GalaxyFileSystem(AbstractFileSystem):
     def touch(self, path, **kwargs):
         raise ReadOnlyError("galaxy-fsspec is read-only")
 
+    def rmdir(self, path):
+        raise ReadOnlyError("galaxy-fsspec is read-only")
+
+    def cp_file(self, path1, path2, **kwargs):
+        raise ReadOnlyError("galaxy-fsspec is read-only")
+
+    def copy(self, path1, path2, recursive=False, maxdepth=None, **kwargs):
+        raise ReadOnlyError("galaxy-fsspec is read-only")
+
+    def mv(self, path1, path2, recursive=False, maxdepth=None, **kwargs):
+        raise ReadOnlyError("galaxy-fsspec is read-only")
+
     # ------------------------------------------------------------------ #
     # Path resolution
     # ------------------------------------------------------------------ #
 
-    @staticmethod
-    def _strip(path: str) -> str:
-        if not path:
-            return ROOT
-        # Drop protocol prefix if present.
-        if "://" in path:
-            path = path.split("://", 1)[1]
-        path = path.strip("/")
-        return path
+    @classmethod
+    def _strip_protocol(cls, path: str) -> str:
+        """Like fsspec's, but also drops a leading slash: paths are relative to the account."""
+        stripped = super()._strip_protocol(path)
+        return stripped.lstrip("/") or ROOT
 
     def _cached_dir(self, path: str) -> list[dict] | None:
         if path in self._dir_cache:
@@ -315,7 +344,7 @@ class GalaxyFileSystem(AbstractFileSystem):
                     "history_id": h["id"],
                     "hid": None,
                     "created": h.get("create_time"),
-                    "last_modified": h.get("update_time"),
+                    "mtime": h.get("update_time"),
                 }
             )
         return entries

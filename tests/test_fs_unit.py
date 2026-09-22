@@ -291,13 +291,13 @@ def fs():
 
 class TestRoot:
     def test_root_lists_histories_dir(self, fs):
-        assert "histories" in fs.ls("/")
+        assert "histories" in fs.ls("/", detail=False)
 
     def test_root_lists_libraries_dir(self, fs):
-        assert "libraries" in fs.ls("/")
+        assert "libraries" in fs.ls("/", detail=False)
 
     def test_root_lists_both(self, fs):
-        assert set(fs.ls("/")) == {"histories", "libraries"}
+        assert set(fs.ls("/", detail=False)) == {"histories", "libraries"}
 
     def test_histories_dir_info(self, fs):
         info = fs.info("histories")
@@ -306,20 +306,20 @@ class TestRoot:
 
 class TestHistories:
     def test_list_histories(self, fs):
-        names = fs.ls("histories")
+        names = fs.ls("histories", detail=False)
         assert names == ["histories/History A"]
 
     def test_history_info_has_dates(self, fs):
         info = fs.info("histories/History A")
         assert info["type"] == "directory"
         assert info["created"] == "2024-01-01T00:00:00"
-        assert info["last_modified"] == "2024-01-02T00:00:00"
+        assert info["mtime"] == "2024-01-02T00:00:00"
         assert info["history_id"] == "hid1"
 
 
 class TestHistoryContents:
     def test_lists_dataset_and_collection(self, fs):
-        names = fs.ls("histories/History A")
+        names = fs.ls("histories/History A", detail=False)
         assert "histories/History A/my-uploaded-dataset" in names
         assert "histories/History A/my result" in names
 
@@ -342,11 +342,11 @@ class TestHistoryContents:
 
 class TestNestedCollections:
     def test_list_list_paired(self, fs):
-        names = fs.ls("histories/History A/my result")
+        names = fs.ls("histories/History A/my result", detail=False)
         assert names == ["histories/History A/my result/sample1"]
 
     def test_descend_into_paired(self, fs):
-        names = fs.ls("histories/History A/my result/sample1")
+        names = fs.ls("histories/History A/my result/sample1", detail=False)
         assert set(names) == {
             "histories/History A/my result/sample1/forward",
             "histories/History A/my result/sample1/reverse",
@@ -364,18 +364,18 @@ class TestNumberedNames:
 
     def test_history_contents_numbered(self):
         fs = self.fs_numbered()
-        names = fs.ls("histories/History A")
+        names = fs.ls("histories/History A", detail=False)
         assert "histories/History A/1-my-uploaded-dataset" in names
         assert "histories/History A/2-my result" in names
 
     def test_collection_elements_numbered(self):
         fs = self.fs_numbered()
-        names = fs.ls("histories/History A/2-my result")
+        names = fs.ls("histories/History A/2-my result", detail=False)
         assert "histories/History A/2-my result/1-sample1" in names
 
     def test_paired_elements_numbered(self):
         fs = self.fs_numbered()
-        names = fs.ls("histories/History A/2-my result/1-sample1")
+        names = fs.ls("histories/History A/2-my result/1-sample1", detail=False)
         assert "histories/History A/2-my result/1-sample1/1-forward" in names
         assert "histories/History A/2-my result/1-sample1/2-reverse" in names
 
@@ -403,6 +403,24 @@ class TestReadOnly:
 
         with pytest.raises(ReadOnlyError):
             fs.rm("histories/History A/my-uploaded-dataset")
+
+    DATASET = "histories/History A/my-uploaded-dataset"
+
+    @pytest.mark.parametrize(
+        "operation",
+        [
+            lambda fs: fs.rmdir("histories/History A"),
+            lambda fs: fs.cp_file(TestReadOnly.DATASET, TestReadOnly.DATASET + " copy"),
+            lambda fs: fs.copy(TestReadOnly.DATASET, TestReadOnly.DATASET + " copy"),
+            lambda fs: fs.mv(TestReadOnly.DATASET, TestReadOnly.DATASET + " moved"),
+        ],
+        ids=["rmdir", "cp_file", "copy", "mv"],
+    )
+    def test_every_mutating_call_raises(self, fs, operation):
+        from galaxy_fsspec.exceptions import ReadOnlyError
+
+        with pytest.raises(ReadOnlyError):
+            operation(fs)
 
 
 class TestNotFound:
@@ -456,13 +474,13 @@ class TestLibrariesRoot:
         assert info["type"] == "directory"
 
     def test_list_libraries(self, fs):
-        names = fs.ls("libraries")
+        names = fs.ls("libraries", detail=False)
         assert "libraries/Shared Data" in names
 
 
 class TestLibraryContents:
     def test_list_library_root(self, fs):
-        names = fs.ls("libraries/Shared Data")
+        names = fs.ls("libraries/Shared Data", detail=False)
         assert "libraries/Shared Data/genomes" in names
         assert "libraries/Shared Data/reads.fastq" in names
 
@@ -478,7 +496,7 @@ class TestLibraryContents:
         assert info["library_id"] == "lib1"
 
     def test_list_nested_folder(self, fs):
-        names = fs.ls("libraries/Shared Data/genomes")
+        names = fs.ls("libraries/Shared Data/genomes", detail=False)
         assert names == ["libraries/Shared Data/genomes/hg38.fa"]
 
     def test_nested_dataset_info(self, fs):
@@ -567,6 +585,13 @@ class TestDownloads:
 class TestReading:
     """A read returns the whole dataset, or says why it cannot."""
 
+    @pytest.mark.parametrize("prefix", ["", "/", "galaxy://"])
+    def test_every_spelling_reads_the_whole_dataset(self, fs, monkeypatch, prefix):
+        fs.gi.datasets.store["dataset_sizes"] = {"dsF": 10}
+        _use_transport(monkeypatch, ByteRangeTransport(b"R1CONTENT!"))
+        with fs.open(prefix + LEAF, "rb") as handle:
+            assert handle.read() == b"R1CONTENT!"
+
     def test_a_failed_lookup_raises_instead_of_reading_empty(self, fs):
         cause = ConnectionError("Galaxy unavailable")
 
@@ -626,3 +651,23 @@ class TestNames:
         assert f"{two}/other.txt" in fs.ls(two, detail=False)
         assert fs.ls("histories/hid2", detail=False) == ["histories/hid2/second-dataset"]
         assert fs.ls("libraries/lib2", detail=False) == ["libraries/lib2/other.txt"]
+
+
+class TestTimestamps:
+    def test_a_missing_date_is_an_error(self, fs):
+        with pytest.raises(GalaxyApiError):
+            fs.modified("histories/History A/my result/sample1/forward")
+
+
+class TestConstruction:
+    def test_walk_skips_a_directory_it_cannot_list(self, fs):
+        """Every error is an OSError, which fsspec's walk skips instead of aborting on."""
+        original = fs._list
+
+        def fail_inside_a_library(path):
+            if path.startswith("libraries/"):
+                raise GalaxyApiError("Galaxy unavailable")
+            return original(path)
+
+        fs._list = fail_inside_a_library
+        assert [root for root, _dirs, _files in fs.walk("libraries")] == ["libraries"]

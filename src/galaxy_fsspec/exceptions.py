@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 
-class GalaxyFsspecError(Exception):
-    """Base error for galaxy-fsspec."""
+class GalaxyFsspecError(OSError):
+    """Base error for galaxy-fsspec.
+
+    Deriving from OSError is deliberate. fsspec's own helpers, ``walk`` and
+    ``find`` among them, catch ``(FileNotFoundError, OSError)`` and skip the
+    entry; anything else escapes and takes the whole traversal with it.
+    """
 
 
 class NotFoundError(GalaxyFsspecError, FileNotFoundError):

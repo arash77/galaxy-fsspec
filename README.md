@@ -6,7 +6,7 @@ Galaxy account as a virtual, read-only directory tree.
 ```
 galaxy://
 ├── histories/
-│   └── <history>/                 (created / last_modified exposed via info())
+│   └── <history>/                 (created / mtime exposed via info())
 │       ├── <dataset>              (files)
 │       └── <collection>/          (list, paired, list:paired, nested ...)
 │           └── ...                (collections nest as folders of folders)
@@ -63,13 +63,13 @@ fs = fsspec.filesystem("galaxy")
 for h in fs.ls("histories", detail=True):
     print(h["name"])
 
-# Timestamps (created / last_modified) are fetched lazily via info().
+# Timestamps are fetched lazily via info(), or as datetimes via
+# fs.created() / fs.modified().
 for h in fs.ls("histories", detail=True):
-    info = fs.info(h["name"])
-    print(info["name"], info["created"], info["last_modified"])
+    print(h["name"], fs.created(h["name"]), fs.modified(h["name"]))
 
 # Walk a history's contents — datasets are files, collections are folders.
-print(fs.ls("histories/My History"))
+print(fs.ls("histories/My History", detail=False))
 
 # Read a dataset (range-aware streaming via Galaxy's display endpoint).
 with fs.open("histories/My History/my-paired/forward", "rb") as f:
