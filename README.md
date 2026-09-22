@@ -72,7 +72,7 @@ for h in fs.ls("histories", detail=True):
 print(fs.ls("histories/My History"))
 
 # Read a dataset (range-aware streaming via Galaxy's display endpoint).
-with fs.open("histories/My History/my-paired/forward/R1.fastq", "rb") as f:
+with fs.open("histories/My History/my-paired/forward", "rb") as f:
     print(f.read(64))
 ```
 
@@ -86,5 +86,12 @@ histories/My History/5-mycollection/1-forward
 
 ## Scope
 
-Read-only for now: histories, datasets, and (nested) collections. Writes,
-uploads, and library browsing are not yet supported.
+Read-only browsing of:
+
+- histories and their datasets,
+- dataset collections, including nested collections,
+- Galaxy data libraries, their folders, and their datasets.
+
+Not supported: writes of any kind — no uploads, no dataset or collection
+mutation, no history or library management. Every write operation raises
+`ReadOnlyError`.

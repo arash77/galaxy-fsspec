@@ -32,8 +32,8 @@ dependencies = [
 galaxy = "galaxy_fsspec.fs:GalaxyFileSystem"
 
 [project.urls]
-Homepage = "https://github.com/galaxyproject/galaxy-fsspec"
-Issues = "https://github.com/galaxyproject/galaxy-fsspec/issues"
+Homepage = "https://github.com/bgruening/galaxy-fsspec"
+Issues = "https://github.com/bgruening/galaxy-fsspec/issues"
 
 [dependency-groups]
 dev = [
