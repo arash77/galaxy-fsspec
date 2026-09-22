@@ -1,47 +1,144 @@
 name: publish
 
+# Only a published GitHub Release can reach PyPI. Creating a tag does nothing:
+# a release is a reviewed, human-created artifact, and the `pypi` environment
+# adds a maintainer approval gate in front of the upload itself.
 on:
-  push:
-    tags:
-      - "v*"
+  release:
+    types: [published]
 
-permissions:
-  contents: read
+permissions: {}
+
+concurrency:
+  group: publish-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
 
 jobs:
   build:
-    name: Build distributions
+    name: Build and validate distributions
+    # Prereleases are deliberately out of scope until a prerelease policy exists.
+    if: ${{ !github.event.release.prerelease }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      UV_PYTHON: "3.12"
+      # Event data reaches the shell only through the environment, never through
+      # direct `${{ }}` interpolation inside a run block.
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v3
+      - name: Checkout the released tag
+        uses: actions/checkout@v7
         with:
-          enable-cache: true
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # No dependency cache in the privileged release path: a poisoned cache
+      # must not be able to influence what gets published.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.2.0
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Preflight — tag must match the declared version
+        run: |
+          set -euo pipefail
+          declared="$(python -c '
+          import pathlib, tomllib
+          data = tomllib.loads(pathlib.Path("pyproject.toml").read_text())
+          print(data["project"]["version"])
+          ')"
+          echo "declared version: ${declared}"
+          echo "release tag:      ${RELEASE_TAG}"
+          if [ "${RELEASE_TAG}" != "v${declared}" ]; then
+            echo "::error::Release tag '${RELEASE_TAG}' does not match" \
+                 "pyproject.toml version '${declared}' (expected 'v${declared}')."
+            exit 1
+          fi
+          tag_commit="$(git rev-list -n 1 "refs/tags/${RELEASE_TAG}")"
+          head_commit="$(git rev-parse HEAD)"
+          if [ "${tag_commit}" != "${head_commit}" ]; then
+            echo "::error::Checked-out commit ${head_commit} is not the target" \
+                 "of tag ${RELEASE_TAG} (${tag_commit})."
+            exit 1
+          fi
+          echo "EXPECTED_VERSION=${declared}" >> "${GITHUB_ENV}"
+
+      - name: Ruff
+        run: uv run ruff check .
+
+      - name: mypy
+        run: uv run mypy src
+
+      - name: Unit tests
+        run: uv run pytest -m "not integration"
+
+      - name: Collect integration tests
+        run: uv run pytest --collect-only -m "integration" -q
 
       - name: Build wheel and sdist
         run: uv build
 
-      - name: Upload distributions
-        uses: actions/upload-artifact@v4
+      # A fresh, ephemeral twine — the project venv's copy can lag behind the
+      # metadata version the build backend emits.
+      - name: Check distribution metadata
+        run: uvx twine check dist/*
+
+      - name: Smoke-test both artifacts in isolated environments
+        run: |
+          set -euo pipefail
+          for artifact in dist/*.whl dist/*.tar.gz; do
+            echo "::group::${artifact}"
+            EXPECTED_VERSION="${EXPECTED_VERSION}" uv run --isolated --no-project \
+              --with "${artifact}" python -c '
+          import os
+          from importlib.metadata import version
+          import fsspec
+          import galaxy_fsspec
+          expected = os.environ["EXPECTED_VERSION"]
+          installed = version("galaxy-fsspec")
+          assert installed == expected, f"metadata {installed} != {expected}"
+          assert galaxy_fsspec.__version__ == expected, galaxy_fsspec.__version__
+          assert fsspec.get_filesystem_class("galaxy") is galaxy_fsspec.GalaxyFileSystem
+          print("ok", installed)
+          '
+            echo "::endgroup::"
+          done
+
+      - name: Upload verified distributions
+        uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
+          if-no-files-found: error
+          retention-days: 7
 
   publish:
     name: Publish to PyPI
-    runs-on: ubuntu-latest
     needs: build
-    environment: pypi
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Protected environment: a maintainer approves the upload after inspecting
+    # the validated artifacts. No repository code runs in this job.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/galaxy-fsspec
     permissions:
-      id-token: write
+      id-token: write # OIDC only — there is no PyPI API token anywhere.
     steps:
-      - name: Download distributions
-        uses: actions/download-artifact@v4
+      - name: Download verified distributions
+        uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist/
 
-      - name: Publish to PyPI
+      - name: Publish via PyPI Trusted Publishing
         uses: pypa/gh-action-pypi-publish@release/v1
