@@ -12,7 +12,7 @@ import requests
 from fsspec.spec import AbstractFileSystem
 
 from galaxy_fsspec.client import build_galaxy_instance, show_hid_in_names_from_env
-from galaxy_fsspec.exceptions import NotFoundError, ReadOnlyError
+from galaxy_fsspec.exceptions import GalaxyApiError, NotFoundError, ReadOnlyError
 from galaxy_fsspec.file import GalaxyFile
 from galaxy_fsspec.paths import (
     dedupe_names,
@@ -142,18 +142,10 @@ class GalaxyFileSystem(AbstractFileSystem):
         # real size here so AbstractBufferedFile.read() actually returns bytes.
         if info.get("size", 0) == 0:
             if "library_dataset_id" in info:
-                ldda_id, size, dl_url = self._library_dataset_details(
-                    info["library_dataset_id"]
-                )
-                info = {
-                    **info,
-                    "size": size,
-                    "ldda_id": ldda_id,
-                    "download_url": dl_url,
-                }
+                ldda_id, size = self._library_dataset_details(info["library_dataset_id"])
+                info = {**info, "size": size, "ldda_id": ldda_id}
             else:
-                size, dl_url = self._dataset_details(info.get("dataset_id"))
-                info = {**info, "size": size, "download_url": dl_url}
+                info = {**info, "size": self._dataset_details(info.get("dataset_id"))}
             self._info_cache[path] = info
         return GalaxyFile(
             self,
@@ -164,53 +156,55 @@ class GalaxyFileSystem(AbstractFileSystem):
             **kwargs,
         )
 
-    def _dataset_details(
+    def _show_dataset(
         self, dataset_id: str | None, hda_ldda: Literal["hda", "ldda"] = "hda"
-    ) -> tuple[int, str | None]:
-        """Return ``(file_size, download_url)`` for a dataset via the datasets API."""
+    ) -> dict:
+        """Fetch dataset metadata; a failed lookup must not read as an empty file."""
         if not dataset_id:
-            return 0, None
+            raise GalaxyApiError("Galaxy returned a dataset entry without an id")
         try:
-            details = self.gi.datasets.show_dataset(dataset_id, hda_ldda=hda_ldda)
-        except Exception:
-            return 0, None
-        if not isinstance(details, dict):
-            return 0, None
-        size = _to_int(details.get("file_size")) or 0
-        dl_url = details.get("download_url")
-        return size, dl_url
+            return dict(self.gi.datasets.show_dataset(dataset_id, hda_ldda=hda_ldda))
+        except Exception as exc:
+            raise GalaxyApiError(
+                f"failed to fetch metadata for dataset {dataset_id}: {exc}"
+            ) from exc
 
-    def _library_dataset_details(
-        self, dataset_id: str | None
-    ) -> tuple[str | None, int, str | None]:
-        """Return ``(ldda_id, file_size, download_url)`` for a library dataset.
+    @staticmethod
+    def _require_file_size(details: dict, dataset_id: str) -> int:
+        """Return the API-reported size. An explicit ``0`` is valid; absent is not."""
+        size = _to_int(details.get("file_size"))
+        if size is None:
+            raise GalaxyApiError(
+                f"Galaxy did not report a file_size for dataset {dataset_id} "
+                f"(state={details.get('state')!r})"
+            )
+        return size
+
+    def _dataset_details(self, dataset_id: str | None) -> int:
+        """Return a history dataset's size from the datasets API."""
+        return self._require_file_size(self._show_dataset(dataset_id), str(dataset_id))
+
+    def _library_dataset_details(self, dataset_id: str | None) -> tuple[str, int]:
+        """Return ``(ldda_id, file_size)`` for a library dataset.
 
         Uses ``gi.datasets.show_dataset(id, hda_ldda='ldda')`` (the datasets
         API) rather than the deprecated libraries contents endpoint.
         """
-        if not dataset_id:
-            return None, 0, None
-        try:
-            details = self.gi.datasets.show_dataset(dataset_id, hda_ldda="ldda")
-        except Exception:
-            return None, 0, None
-        if not isinstance(details, dict):
-            return None, 0, None
+        details = self._show_dataset(dataset_id, hda_ldda="ldda")
+        size = self._require_file_size(details, str(dataset_id))
         ldda_id = details.get("id")
-        size = _to_int(details.get("file_size")) or 0
-        dl_url = details.get("download_url")
-        return ldda_id, size, dl_url
+        if not ldda_id:
+            raise GalaxyApiError(f"Galaxy did not report an id for library dataset {dataset_id}")
+        return str(ldda_id), size
 
     def _fetch_dataset_range(self, path: str, start: int, end: int) -> bytes:
         info = self._info(path)
-        dl_url = info.get("download_url")
-        if dl_url:
-            return self._download_range_from_url(dl_url, start, end)
         if "ldda_id" in info:
-            return self._download_range(
-                info["ldda_id"], start, end, hda_ldda="ldda"
-            )
-        return self._download_range(info["dataset_id"], start, end)
+            return self._download_range(info["ldda_id"], start, end, hda_ldda="ldda")
+        dataset_id = info.get("dataset_id")
+        if not dataset_id:
+            raise GalaxyApiError(f"no Galaxy dataset id is known for {path!r}")
+        return self._download_range(dataset_id, start, end)
 
     # Read-only enforcement -------------------------------------------------
     def _rm(self, path):
@@ -570,26 +564,6 @@ class GalaxyFileSystem(AbstractFileSystem):
         if hda_ldda != "hda":
             url += f"?hda_ldda={hda_ldda}"
         return self._download_from_url(url, start, end, dataset_id)
-
-    def _download_range_from_url(
-        self, download_url: str, start: int, end: int
-    ) -> bytes:
-        """Download a range using a ``download_url`` from the datasets API.
-
-        The ``download_url`` is a relative path like
-        ``/api/datasets/{id}/display?to_ext=txt``.  We strip the ``to_ext``
-        query param (which forces a full download with content-type headers)
-        and use the base URL with Range headers instead.
-        """
-        if end <= start:
-            return b""
-        url = download_url
-        if url.startswith("/"):
-            url = f"{self._url}{url}"
-        # Remove to_ext param so we get raw bytes, not a forced download.
-        if "?to_ext=" in url:
-            url = url.split("?to_ext=")[0]
-        return self._download_from_url(url, start, end, url)
 
     def _download_from_url(
         self, url: str, start: int, end: int, label: str
