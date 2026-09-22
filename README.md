@@ -95,6 +95,6 @@ Read-only browsing of:
 - dataset collections, including nested collections,
 - Galaxy data libraries, their folders, and their datasets.
 
-Not supported: writes of any kind — no uploads, no dataset or collection
+Not supported: writes of any kind. No uploads, no dataset or collection
 mutation, no history or library management. Every write operation raises
 `ReadOnlyError`.

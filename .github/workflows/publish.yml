@@ -48,7 +48,7 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked
 
-      - name: Preflight — tag must match the declared version
+      - name: Preflight, tag must match the declared version
         run: |
           set -euo pipefail
           declared="$(python -c '
@@ -87,7 +87,7 @@ jobs:
       - name: Build wheel and sdist
         run: uv build
 
-      # A fresh, ephemeral twine — the project venv's copy can lag behind the
+      # A fresh, ephemeral twine: the project venv's copy can lag behind the
       # metadata version the build backend emits.
       - name: Check distribution metadata
         run: uvx twine check dist/*
@@ -160,7 +160,7 @@ jobs:
       name: pypi
       url: https://pypi.org/p/galaxy-fsspec
     permissions:
-      id-token: write # OIDC only — there is no PyPI API token anywhere.
+      id-token: write # OIDC only; there is no PyPI API token anywhere.
     steps:
       - name: Download verified distributions
         uses: actions/download-artifact@v8

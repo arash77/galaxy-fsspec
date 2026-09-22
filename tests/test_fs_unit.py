@@ -22,7 +22,7 @@ class FakeHistories:
     #: serialization. They live on HDADetailed, which only ``details`` asks for.
     #: Verified against usegalaxy.eu and a 26.2.dev0 server on 2026-09-22: the
     #: default listing carries create_time and update_time but never file_size.
-    _DETAIL_ONLY = ("file_size",)
+    _DETAIL_ONLY = ("file_size", "elements")
 
     def show_history(self, history_id, contents=True, details=None, keys=None):
         hist = next(h for h in self.store["histories"] if h["id"] == history_id)
@@ -48,32 +48,92 @@ class FakeHistories:
 
 
 class FakeDatasetCollections:
+    """``/api/dataset_collections/{id}`` decodes its id against the HDCA table.
+
+    A nested collection's ``object.id`` is a DatasetCollection id, which is a
+    different table. The fake used to serve both from one flat dict, which is
+    what let the code re-fetch a nested collection by the wrong id and appear
+    to work.
+    """
+
     def __init__(self, store):
         self.store = store
 
     def show_dataset_collection(self, collection_id):
-        return {"elements": self.store["collections"][collection_id]}
+        hdcas = {
+            item["id"]: item
+            for hist in self.store.get("histories", [])
+            for item in hist.get("contents", [])
+            if item.get("history_content_type") == "dataset_collection"
+        }
+        if collection_id not in hdcas:
+            raise ConnectionError(
+                f"Unexpected HTTP status code: 404 ({collection_id} is not an HDCA)"
+            )
+        return dict(hdcas[collection_id])
 
 
 class FakeDatasets:
+    """``/api/datasets/{id}``.
+
+    ``hda_ldda`` selects which table the id is decoded against. They are
+    separate tables with separate id sequences, so an id from one of them is
+    either absent from the other or names a different object. The fake used to
+    collapse the two, which is exactly what hid a bug that returns another
+    dataset's bytes against a real Galaxy.
+    """
+
     def __init__(self, store):
         self.store = store
 
-    def show_dataset(self, dataset_id, hda_ldda="hda"):
-        # Check library dataset sizes first, then history dataset_sizes.
+    def _hdas(self):
+        known = {}
+
+        def walk(elements):
+            for el in elements or []:
+                inner = el.get("object") or {}
+                if el.get("element_type") == "dataset_collection":
+                    walk(inner.get("elements"))
+                elif inner.get("id"):
+                    known[inner["id"]] = inner.get("name", "")
+
+        for hist in self.store.get("histories", []):
+            for item in hist.get("contents", []):
+                if item.get("history_content_type") == "dataset_collection":
+                    walk(item.get("elements"))
+                else:
+                    known[item["id"]] = item.get("name", "")
+        return known
+
+    def _lddas(self):
+        known = {}
         for lib in self.store.get("libraries", []):
             for item in lib.get("contents", []):
-                if item.get("type") == "file" and item.get("id") == dataset_id:
-                    return {
-                        "id": item.get("ldda_id", dataset_id),
-                        "file_size": item.get("file_size", 1024),
-                        "state": "ok",
-                    }
+                if item.get("type") == "file" and item.get("ldda_id"):
+                    known[item["ldda_id"]] = item
+        return known
+
+    def show_dataset(self, dataset_id, hda_ldda="hda"):
+        if hda_ldda == "ldda":
+            item = self._lddas().get(dataset_id)
+            if item is None:
+                raise ConnectionError(f"Unexpected HTTP status code: 404 ({dataset_id})")
+            return {
+                "id": dataset_id,
+                "file_size": item.get("file_size", 0),
+                "name": item.get("name", "").rsplit("/", 1)[-1],
+                "state": item.get("state", "ok"),
+                "update_time": "2024-01-02T00:00:00",
+            }
+        known = self._hdas()
+        if dataset_id not in known:
+            raise ConnectionError(f"Unexpected HTTP status code: 404 ({dataset_id})")
         sizes = self.store.get("dataset_sizes", {})
+        states = self.store.get("dataset_states", {})
         return {
             "id": dataset_id,
             "file_size": sizes.get(dataset_id, 1024),
-            "state": "ok",
+            "state": states.get(dataset_id, "ok"),
         }
 
 
@@ -87,8 +147,38 @@ class FakeLibraries:
     def show_library(self, library_id, contents=False):
         lib = next(lb for lb in self.store["libraries"] if lb["id"] == library_id)
         if contents:
-            return lib["contents"]
+            # The real endpoint returns only these four keys.
+            return [
+                {k: v for k, v in item.items() if k in ("id", "name", "type", "url")}
+                for item in lib["contents"]
+            ]
         return {"id": lib["id"], "name": lib["name"]}
+
+    def show_dataset(self, library_id, dataset_id):
+        """``/api/libraries/{library_id}/contents/{id}``.
+
+        This is the call that translates a LibraryDataset id into the LDDA id
+        its bytes live under. Signature matches bioblend exactly.
+        """
+        lib = next(lb for lb in self.store["libraries"] if lb["id"] == library_id)
+        item = next(
+            (
+                c
+                for c in lib["contents"]
+                if c.get("type") == "file" and c.get("id") == dataset_id
+            ),
+            None,
+        )
+        if item is None:
+            raise ConnectionError(f"Unexpected HTTP status code: 404 ({dataset_id})")
+        return {
+            "id": item["id"],
+            "ldda_id": item["ldda_id"],
+            "file_size": item.get("file_size", 0),
+            "name": item["name"].rsplit("/", 1)[-1],
+            "state": item.get("state", "ok"),
+            "update_time": "2024-01-02T00:00:00",
+        }
 
 
 class FakeGalaxyInstance:
@@ -187,38 +277,39 @@ def _store():
                         "name": "my result",
                         "history_content_type": "dataset_collection",
                         "collection_type": "list:paired",
+                        "populated": True,
+                        "element_count": 1,
+                        "elements": [
+                            {
+                                "element_type": "dataset_collection",
+                                "element_index": 0,
+                                "element_identifier": "sample1",
+                                "object": {
+                                    "id": "subcoll1",
+                                    "collection_type": "paired",
+                                    "populated": True,
+                                    "element_count": 2,
+                                    "elements": [
+                                        {
+                                            "element_type": "hda",
+                                            "element_index": 0,
+                                            "element_identifier": "forward",
+                                            "object": {"id": "dsF", "name": "R1"},
+                                        },
+                                        {
+                                            "element_type": "hda",
+                                            "element_index": 1,
+                                            "element_identifier": "reverse",
+                                            "object": {"id": "dsR", "name": "R2"},
+                                        },
+                                    ],
+                                },
+                            },
+                        ],
                     },
                 ],
             }
         ],
-        "collections": {
-            "coll1": [
-                {
-                    "element_type": "dataset_collection",
-                    "element_index": 0,
-                    "element_identifier": "sample1",
-                    "object": {
-                        "id": "subcoll1",
-                        "name": "sample1",
-                        "collection_type": "paired",
-                    },
-                },
-            ],
-            "subcoll1": [
-                {
-                    "element_type": "hda",
-                    "element_index": 0,
-                    "element_identifier": "forward",
-                    "object": {"id": "dsF", "name": "R1"},
-                },
-                {
-                    "element_type": "hda",
-                    "element_index": 1,
-                    "element_identifier": "reverse",
-                    "object": {"id": "dsR", "name": "R2"},
-                },
-            ],
-        },
         "libraries": [
             {
                 "id": "lib1",
@@ -515,12 +606,14 @@ class TestLibraryContents:
 
 class TestLibraryFileRead:
     def test_open_and_read_library_dataset(self, fs, monkeypatch):
-        """Library datasets are read through Galaxy's display endpoint."""
+        """Library bytes are read by LDDA id, never by the LibraryDataset id."""
         transport = _use_transport(monkeypatch, ByteRangeTransport(b"GTACGTACGTACGT"))
         with fs.open("libraries/Shared Data/genomes/hg38.fa", "rb") as f:
             assert f.size == 14
             assert f.read() == b"GTACGTACGTACGT"
-        assert "display" in transport.calls[0]["url"]
+        assert transport.calls[0]["url"] == (
+            "https://galaxy.example/api/datasets/ldda1/display?hda_ldda=ldda"
+        )
 
     def test_open_and_read_root_library_dataset(self, fs, monkeypatch):
         _use_transport(monkeypatch, ByteRangeTransport(b"ATGCATGCAT"))
@@ -627,25 +720,31 @@ class TestReading:
             raise cause
 
         fs.gi.datasets.show_dataset = boom
+        fs.gi.libraries.show_dataset = boom
         for path in (LEAF, "libraries/Shared Data/genomes/hg38.fa"):
             with pytest.raises(GalaxyApiError) as excinfo:
                 fs.open(path, "rb")
             assert excinfo.value.__cause__ is cause
 
     def test_a_missing_size_is_an_error(self, fs):
-        fs.gi.datasets.show_dataset = lambda dataset_id, hda_ldda="hda": {"id": dataset_id}
+        fs.gi.datasets.show_dataset = lambda dataset_id: {"id": dataset_id}
         with pytest.raises(GalaxyApiError):
             fs.open(LEAF, "rb")
 
-    def test_a_zero_size_is_an_empty_dataset(self, fs):
-        fs.gi.datasets.show_dataset = lambda dataset_id, hda_ldda="hda": {"file_size": 0}
-        with fs.open(LEAF, "rb") as handle:
-            assert handle.read() == b""
+    @pytest.mark.parametrize("state", ["ok", "error"])
+    def test_a_zero_size_is_believed_only_when_the_state_is_ok(self, fs, state):
+        fs.gi.datasets.show_dataset = lambda dataset_id: {"file_size": 0, "state": state}
+        if state == "ok":
+            with fs.open(LEAF, "rb") as handle:
+                assert handle.read() == b""
+        else:
+            with pytest.raises(GalaxyApiError, match=state):
+                fs.open(LEAF, "rb")
 
     @pytest.mark.parametrize("element", [{"name": "R1"}, {"name": "R1", "file_size": 5}])
     def test_an_entry_without_a_dataset_id_is_an_error(self, monkeypatch, element):
         store = _store()
-        store["collections"]["subcoll1"] = [
+        store["histories"][0]["contents"][1]["elements"][0]["object"]["elements"] = [
             {
                 "element_type": "hda",
                 "element_index": 0,
@@ -658,7 +757,7 @@ class TestReading:
             make_fs(store).open(LEAF, "rb").read()
 
     def test_a_library_dataset_without_an_ldda_id_is_an_error(self, fs):
-        fs.gi.datasets.show_dataset = lambda dataset_id, hda_ldda="hda": {
+        fs.gi.libraries.show_dataset = lambda library_id, dataset_id: {
             "file_size": 0,
             "state": "ok",
         }
@@ -689,6 +788,11 @@ class TestNames:
         fs._clear_cache()
         assert {path: fs.ls(path, detail=False) for path in listed} == before
 
+    @pytest.mark.parametrize("path", ["histories/History A", "libraries/Shared Data"])
+    def test_a_plain_name_that_means_two_things_is_refused(self, path):
+        with pytest.raises(NotFoundError, match="__"):
+            make_fs(_store_with_namesakes()).ls(path)
+
     def test_library_namesakes_each_get_a_path(self):
         store = _store()
         store["libraries"][0]["contents"] += [
@@ -699,17 +803,28 @@ class TestNames:
                 "ldda_id": "lddaX",
                 "file_size": 9,
             },
+            {"id": "dsG", "type": "file", "name": "/genomes", "ldda_id": "lddaG", "file_size": 7},
         ]
         fs = make_fs(store)
         entries = fs.ls("libraries/Shared Data", detail=True)
         assert len({entry["name"] for entry in entries}) == len(entries)
-        assert {"dsL2", "dsX"} <= {entry.get("library_dataset_id") for entry in entries}
+        assert {"dsL2", "dsX", "dsG"} <= {entry.get("library_dataset_id") for entry in entries}
+        assert fs.info("libraries/Shared Data/genomes")["type"] == "directory"
 
 
 class TestCollectionsAndLibraries:
     def test_a_nested_collection_reports_its_own_type(self, fs):
         entries = fs.ls("histories/History A/my result", detail=True)
         assert [entry["collection_type"] for entry in entries] == ["paired"]
+
+    def test_descending_never_refetches_a_collection(self, fs):
+        """A nested element's id is not an HDCA id; fetching by it returns another collection."""
+
+        def refuse(collection_id):
+            raise AssertionError(f"re-fetched {collection_id}")
+
+        fs.gi.dataset_collections.show_dataset_collection = refuse
+        assert fs.ls("histories/History A/my result/sample1", detail=False)
 
 
 class TestTimestamps:
@@ -737,6 +852,11 @@ class TestConstruction:
         fs = make_fs(api_key="SECRET")
         assert "SECRET" not in fs.to_json(include_password=False)
         assert fs.to_dict()["api_key"] == "SECRET"
+
+    def test_the_key_cannot_be_passed_positionally(self):
+        """Positional arguments are serialised where include_password cannot reach them."""
+        with pytest.raises(TypeError):
+            GalaxyFileSystem("https://galaxy.example", "SECRET")
 
     def test_callers_with_different_keys_do_not_share_an_instance(self, monkeypatch):
         monkeypatch.setenv("GALAXY_URL", "https://galaxy.example")

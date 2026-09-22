@@ -6,7 +6,7 @@ import datetime as dt
 import time
 import urllib.parse
 from collections.abc import Iterable
-from typing import Any, Literal
+from typing import Any
 
 import requests
 from fsspec.spec import AbstractFileSystem
@@ -58,6 +58,7 @@ class GalaxyFileSystem(AbstractFileSystem):
 
     def __init__(
         self,
+        *,
         url: str | None = None,
         api_key: str | None = None,
         show_hid_in_names: bool | None = None,
@@ -190,7 +191,9 @@ class GalaxyFileSystem(AbstractFileSystem):
         # real size here so AbstractBufferedFile.read() actually returns bytes.
         if info.get("size", 0) == 0:
             if "library_dataset_id" in info:
-                ldda_id, size = self._library_dataset_details(info["library_dataset_id"])
+                ldda_id, size = self._library_dataset_details(
+                    info["library_id"], info["library_dataset_id"]
+                )
                 info = {**info, "size": size, "ldda_id": ldda_id}
             else:
                 info = {**info, "size": self._dataset_details(info.get("dataset_id"))}
@@ -204,14 +207,12 @@ class GalaxyFileSystem(AbstractFileSystem):
             **kwargs,
         )
 
-    def _show_dataset(
-        self, dataset_id: str | None, hda_ldda: Literal["hda", "ldda"] = "hda"
-    ) -> dict:
+    def _show_dataset(self, dataset_id: str | None) -> dict:
         """Fetch dataset metadata; a failed lookup must not read as an empty file."""
         if not dataset_id:
             raise GalaxyApiError("Galaxy returned a dataset entry without an id")
         try:
-            return dict(self.gi.datasets.show_dataset(dataset_id, hda_ldda=hda_ldda))
+            return dict(self.gi.datasets.show_dataset(dataset_id))
         except Exception as exc:
             raise GalaxyApiError(
                 f"failed to fetch metadata for dataset {dataset_id}: {exc}"
@@ -219,12 +220,19 @@ class GalaxyFileSystem(AbstractFileSystem):
 
     @staticmethod
     def _require_file_size(details: dict, dataset_id: str) -> int:
-        """Return the API-reported size. An explicit ``0`` is valid; absent is not."""
+        """Return the reported size. Galaxy reports 0 for a dataset whose size it does not know,
+        so 0 is only believed when the state is ok."""
         size = _to_int(details.get("file_size"))
         if size is None:
             raise GalaxyApiError(
                 f"Galaxy did not report a file_size for dataset {dataset_id} "
                 f"(state={details.get('state')!r})"
+            )
+        state = details.get("state")
+        if size == 0 and state is not None and state != "ok":
+            raise GalaxyApiError(
+                f"dataset {dataset_id} is in state {state!r}, so its size is not "
+                f"known yet; reading it would return an empty file"
             )
         return size
 
@@ -232,17 +240,24 @@ class GalaxyFileSystem(AbstractFileSystem):
         """Return a history dataset's size from the datasets API."""
         return self._require_file_size(self._show_dataset(dataset_id), str(dataset_id))
 
-    def _library_dataset_details(self, dataset_id: str | None) -> tuple[str, int]:
+    def _library_dataset_details(self, library_id: str, dataset_id: str) -> tuple[str, int]:
         """Return ``(ldda_id, file_size)`` for a library dataset.
 
-        Uses ``gi.datasets.show_dataset(id, hda_ldda='ldda')`` (the datasets
-        API) rather than the deprecated libraries contents endpoint.
+        Listings give LibraryDataset ids, but the bytes live under an LDDA id; decoding one as
+        the other finds a different dataset rather than failing. Only this endpoint maps them.
         """
-        details = self._show_dataset(dataset_id, hda_ldda="ldda")
+        try:
+            details = self.gi.libraries.show_dataset(library_id, dataset_id)
+        except Exception as exc:
+            raise GalaxyApiError(
+                f"failed to fetch metadata for library dataset {dataset_id}: {exc}"
+            ) from exc
         size = self._require_file_size(details, str(dataset_id))
-        ldda_id = details.get("id")
+        ldda_id = details.get("ldda_id")
         if not ldda_id:
-            raise GalaxyApiError(f"Galaxy did not report an id for library dataset {dataset_id}")
+            raise GalaxyApiError(
+                f"Galaxy did not report an ldda_id for library dataset {dataset_id}"
+            )
         return str(ldda_id), size
 
     def _fetch_dataset_range(self, path: str, start: int, end: int) -> bytes:
@@ -375,10 +390,17 @@ class GalaxyFileSystem(AbstractFileSystem):
         for display, h in named:
             if segment == display:
                 return h
-        # Fall back to the raw (possibly ambiguous) name, then the raw id.
-        for _display, h in named:
-            if segment == sanitize_segment(h.get("name") or ""):
-                return h
+        # Then the raw name, which the display form may have numbered, and
+        # finally the raw id.
+        matched = [
+            (display, h)
+            for display, h in named
+            if segment == sanitize_segment(h.get("name") or "")
+        ]
+        if len(matched) == 1:
+            return matched[0][1]
+        if matched:
+            raise NotFoundError(_ambiguous(f"{HISTORIES_DIR}/{segment}", matched))
         for h in histories:
             if h["id"] == segment:
                 return h
@@ -410,9 +432,15 @@ class GalaxyFileSystem(AbstractFileSystem):
         for display, lib in named:
             if segment == display:
                 return lib
-        for _display, lib in named:
-            if segment == sanitize_segment(lib.get("name") or ""):
-                return lib
+        matched = [
+            (display, lib)
+            for display, lib in named
+            if segment == sanitize_segment(lib.get("name") or "")
+        ]
+        if len(matched) == 1:
+            return matched[0][1]
+        if matched:
+            raise NotFoundError(_ambiguous(f"{LIBRARIES_DIR}/{segment}", matched))
         for lib in libraries:
             if lib["id"] == segment:
                 return lib
@@ -456,18 +484,22 @@ class GalaxyFileSystem(AbstractFileSystem):
             children.append((remainder, item))
 
         # Uploading the same file twice gives one folder two datasets with the
-        # same name, and without this they share a path: the second is
-        # unreachable and the first is served twice. Folders are left alone
-        # because descent rebuilds the Galaxy-side path from these names, and
-        # the flat contents endpoint cannot tell two same-named folders apart
-        # in the first place.
+        # same name, and Galaxy also permits a dataset named like a sibling
+        # folder. Either way they would share a path: one becomes unreachable
+        # and the other is served twice.
+        #
+        # Deduplicate across every child, so a file can see a folder it clashes
+        # with, but let folders keep the plain name: descending into a library
+        # rebuilds the Galaxy-side path from the displayed folder names, so a
+        # renamed folder could not be entered. Two folders with one name stay
+        # ambiguous, because the flat contents endpoint gives them the same
+        # path and offers nothing to tell them apart.
         deduped = iter(
             name
             for name, _ in dedupe_names(
                 [
                     {"name": remainder, "id": item.get("id")}
                     for remainder, item in children
-                    if item.get("type") != "folder"
                 ],
                 numbered=False,
             )
@@ -476,7 +508,8 @@ class GalaxyFileSystem(AbstractFileSystem):
         entries: list[dict] = []
         for remainder, item in children:
             is_folder = item.get("type") == "folder"
-            display = remainder if is_folder else next(deduped)
+            candidate = next(deduped)
+            display = remainder if is_folder else candidate
             entry: dict = {
                 "name": f"{path}/{display}",
                 "type": "directory" if is_folder else "file",
@@ -529,6 +562,7 @@ class GalaxyFileSystem(AbstractFileSystem):
             else:
                 entry["size"] = _to_int(item.get("file_size") or item.get("size")) or 0
                 entry["dataset_id"] = item.get("id")
+                entry["state"] = item.get("state")
             entries.append(entry)
         return entries
 
@@ -547,16 +581,32 @@ class GalaxyFileSystem(AbstractFileSystem):
         if not current.get("_is_collection"):
             # A top-level dataset has no children.
             raise NotFoundError(path)
-        # Walk intermediate segments through nested collections.
+        elements = self._require_elements(current, segments[0])
+        # Walk intermediate segments through nested collections. The elements
+        # are already in hand at every level, because the history listing asks
+        # for details and Galaxy serialises the whole nested tree inline.
         for seg in segments[1:]:
-            elements = self._collection_elements(current["id"])
-            current = self._resolve_in_elements(elements, seg)
-            if not current.get("_is_collection"):
+            child = self._resolve_in_elements(elements, seg)
+            if not child.get("_is_collection"):
                 # Landed on a dataset leaf; no further descent is possible.
                 raise NotFoundError(path)
-        # ``current`` is the final collection; list its elements.
-        elements = self._collection_elements(current["id"])
+            elements = self._require_elements(child, seg)
         return self._elements_to_entries(elements, path)
+
+    @staticmethod
+    def _require_elements(collection: dict, name: str) -> list[dict]:
+        """Return a collection's elements, which the listing carries inline.
+
+        Do not re-fetch them: a nested ``object.id`` is not an HDCA id, and the fetch would return a
+        different collection instead of failing.
+        """
+        elements = collection.get("elements")
+        if elements is None:
+            raise GalaxyApiError(
+                f"Galaxy did not include the elements of collection {name!r}, "
+                f"so its contents cannot be listed"
+            )
+        return list(elements)
 
     def _resolve_in_contents(self, contents: list[dict], segment: str) -> dict:
         named = dedupe_names(contents, numbered=self.show_hid_in_names)
@@ -564,7 +614,11 @@ class GalaxyFileSystem(AbstractFileSystem):
             disp_name = display.rsplit("/", 1)[-1]
             if segment == disp_name:
                 if item.get("history_content_type") == "dataset_collection":
-                    return {"id": item["id"], "_is_collection": True}
+                    return {
+                        "id": item["id"],
+                        "_is_collection": True,
+                        "elements": item.get("elements"),
+                    }
                 return {"id": item["id"], "_is_collection": False}
         raise NotFoundError(segment)
 
@@ -575,13 +629,13 @@ class GalaxyFileSystem(AbstractFileSystem):
                 continue
             inner = _element_inner(original)
             if original.get("element_type") == "dataset_collection":
-                return {"id": inner.get("id"), "_is_collection": True}
+                return {
+                    "id": inner.get("id"),
+                    "_is_collection": True,
+                    "elements": inner.get("elements"),
+                }
             return {"id": inner.get("id"), "_is_collection": False}
         raise NotFoundError(segment)
-
-    def _collection_elements(self, collection_id: str) -> list[dict]:
-        details = self.gi.dataset_collections.show_dataset_collection(collection_id)
-        return list(details.get("elements") or [])
 
     def _name_elements(self, elements: list[dict]) -> list[tuple[str, dict, int | None]]:
         """Return ``(display_name, original_element, hid)`` tuples.
@@ -753,6 +807,16 @@ def _origin(url: str) -> tuple[str, str, int | None]:
     except ValueError:  # malformed port
         port = None
     return scheme, (parsed.hostname or "").lower(), port or _DEFAULT_PORTS.get(scheme)
+
+
+def _ambiguous(path: str, matched: list[tuple[str, dict]]) -> str:
+    """Message for a plain name that more than one object answers to; picking one would depend
+    on the order Galaxy lists them in."""
+    offered = ", ".join(sorted(display for display, _item in matched))
+    return (
+        f"{path} is ambiguous: {len(matched)} objects share that name. "
+        f"Use one of: {offered}"
+    )
 
 
 def _to_int(value: Any) -> int | None:

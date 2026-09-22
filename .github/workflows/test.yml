@@ -71,6 +71,41 @@ jobs:
           include-hidden-files: true
           if-no-files-found: error
 
+  lowest-dependencies:
+    name: Oldest dependencies the floors allow
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      UV_PYTHON: "3.10"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.10"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: pyproject.toml
+
+      # Deliberately not --locked: the lock pins current versions, and the point
+      # of this job is to exercise the oldest ones the declared floors permit.
+      # Without it a floor can name a version that was never released, or one
+      # that cannot run the code, and nothing notices until a user installs it.
+      - name: Resolve the oldest allowed dependencies
+        run: uv sync --resolution lowest-direct
+
+      - name: Unit tests
+        run: uv run --resolution lowest-direct pytest -m "not integration"
+
   integration:
     name: Integration tests (live Galaxy)
     runs-on: ubuntu-latest
