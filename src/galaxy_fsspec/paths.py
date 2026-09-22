@@ -11,8 +11,6 @@ When ``show_hid_in_names`` is enabled, each entry is prefixed with its ``hid``
 
 from __future__ import annotations
 
-from typing import NamedTuple
-
 # Characters that must not appear in a single path segment.
 _SLASH_REPLACEMENT = "_"
 
@@ -33,36 +31,6 @@ def name_with_prefix(hid: int | None, name: str, numbered: bool) -> str:
     if numbered and hid is not None:
         return f"{int(hid)}-{sanitized}"
     return sanitized
-
-
-class ParsedNumbered(NamedTuple):
-    """Result of parsing a numbered path segment."""
-
-    hid: int | None
-    name: str
-
-
-def parse_numbered_name(segment: str) -> ParsedNumbered:
-    """Split a leading ``<int>-`` prefix from a path segment.
-
-    Returns ``ParsedNumbered(hid=None, name=segment)`` when there is no
-    integer prefix. Always returns the full remainder (including any
-    further hyphens) as ``name``.
-    """
-    if not segment:
-        return ParsedNumbered(None, segment)
-    # Find the first hyphen and check the run-up is all digits.
-    dash = segment.find("-")
-    if dash <= 0:
-        return ParsedNumbered(None, segment)
-    head = segment[:dash]
-    if not head.lstrip("-").isdigit():
-        return ParsedNumbered(None, segment)
-    try:
-        hid = int(head)
-    except ValueError:
-        return ParsedNumbered(None, segment)
-    return ParsedNumbered(hid, segment[dash + 1 :])
 
 
 def dedupe_names(items: list[dict], numbered: bool) -> list[tuple[str, dict]]:

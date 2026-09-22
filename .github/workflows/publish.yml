@@ -92,6 +92,34 @@ jobs:
       - name: Check distribution metadata
         run: uvx twine check dist/*
 
+      # PEP 639 allows a License-Expression or a License classifier, never both,
+      # and PyPI rejects an upload that carries the pair. twine check does not
+      # look, so without this the run fails at the very last step, after the
+      # environment's approval gate. Read the built metadata rather than
+      # pyproject.toml, because that is what actually gets uploaded.
+      - name: Refuse metadata that names the license twice
+        run: |
+          set -euo pipefail
+          for artifact in dist/*.whl dist/*.tar.gz; do
+            case "${artifact}" in
+              *.whl)    metadata="$(unzip -p "${artifact}" '*.dist-info/METADATA')" ;;
+              *.tar.gz) metadata="$(tar xzOf "${artifact}" --wildcards '*/PKG-INFO')" ;;
+            esac
+            expression="$(printf '%s\n' "${metadata}" | grep -c '^License-Expression:' || true)"
+            classifier="$(printf '%s\n' "${metadata}" | grep -c '^Classifier: License ::' || true)"
+            echo "${artifact}: License-Expression=${expression} classifier=${classifier}"
+            if [ "${expression}" -gt 0 ] && [ "${classifier}" -gt 0 ]; then
+              echo "::error::${artifact} carries both a License-Expression and a" \
+                   "License classifier. PEP 639 makes these mutually exclusive and" \
+                   "PyPI will reject the upload. Drop the classifier from pyproject.toml."
+              exit 1
+            fi
+            if [ "${expression}" -eq 0 ] && [ "${classifier}" -eq 0 ]; then
+              echo "::error::${artifact} declares no license at all."
+              exit 1
+            fi
+          done
+
       - name: Smoke-test both artifacts in isolated environments
         run: |
           set -euo pipefail

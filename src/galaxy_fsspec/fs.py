@@ -8,7 +8,6 @@ import urllib.parse
 from collections.abc import Iterable
 from typing import Any, Literal
 
-import fsspec
 import requests
 from fsspec.spec import AbstractFileSystem
 
@@ -246,13 +245,7 @@ class GalaxyFileSystem(AbstractFileSystem):
     def makedirs(self, path, exist_ok=False):
         raise ReadOnlyError("galaxy-fsspec is read-only")
 
-    def _mkdir(self, path, **kwargs):
-        raise ReadOnlyError("galaxy-fsspec is read-only")
-
     def pipe_file(self, path, value, **kwargs):
-        raise ReadOnlyError("galaxy-fsspec is read-only")
-
-    def _pipe_file(self, path, value, **kwargs):
         raise ReadOnlyError("galaxy-fsspec is read-only")
 
     def touch(self, path, **kwargs):
@@ -457,10 +450,10 @@ class GalaxyFileSystem(AbstractFileSystem):
     def _list_history_contents(self, history: dict, path: str) -> list[dict]:
         hid = history["id"]
         contents = self.gi.histories.show_history(hid, contents=True)
-        return self._contents_to_entries(contents, path, history_id=hid)
+        return self._contents_to_entries(contents, path)
 
     def _contents_to_entries(
-        self, contents: Iterable[dict], parent_path: str, history_id: str
+        self, contents: Iterable[dict], parent_path: str
     ) -> list[dict]:
         named = dedupe_names(list(contents), numbered=self.show_hid_in_names)
         entries: list[dict] = []
@@ -492,22 +485,22 @@ class GalaxyFileSystem(AbstractFileSystem):
         top-level collection, any later segments descend into nested collections.
         """
         contents = self.gi.histories.show_history(history["id"], contents=True)
-        current = self._resolve_in_contents(contents, segments[0], history["id"])
+        current = self._resolve_in_contents(contents, segments[0])
         if not current.get("_is_collection"):
             # A top-level dataset has no children.
             raise NotFoundError(path)
         # Walk intermediate segments through nested collections.
         for seg in segments[1:]:
             elements = self._collection_elements(current["id"])
-            current = self._resolve_in_elements(elements, seg, current["id"])
+            current = self._resolve_in_elements(elements, seg)
             if not current.get("_is_collection"):
                 # Landed on a dataset leaf; no further descent is possible.
                 raise NotFoundError(path)
         # ``current`` is the final collection; list its elements.
         elements = self._collection_elements(current["id"])
-        return self._elements_to_entries(elements, path, history["id"])
+        return self._elements_to_entries(elements, path)
 
-    def _resolve_in_contents(self, contents: list[dict], segment: str, history_id: str) -> dict:
+    def _resolve_in_contents(self, contents: list[dict], segment: str) -> dict:
         named = dedupe_names(contents, numbered=self.show_hid_in_names)
         for display, item in named:
             disp_name = display.rsplit("/", 1)[-1]
@@ -517,9 +510,7 @@ class GalaxyFileSystem(AbstractFileSystem):
                 return {"id": item["id"], "_is_collection": False}
         raise NotFoundError(segment)
 
-    def _resolve_in_elements(
-        self, elements: list[dict], segment: str, parent_collection_id: str
-    ) -> dict:
+    def _resolve_in_elements(self, elements: list[dict], segment: str) -> dict:
         for display, original, _hid in self._name_elements(elements):
             disp_name = display.rsplit("/", 1)[-1]
             if segment != disp_name:
@@ -558,9 +549,7 @@ class GalaxyFileSystem(AbstractFileSystem):
             for i, (display, _item) in enumerate(deduped)
         ]
 
-    def _elements_to_entries(
-        self, elements: list[dict], parent_path: str, history_id: str
-    ) -> list[dict]:
+    def _elements_to_entries(self, elements: list[dict], parent_path: str) -> list[dict]:
         entries: list[dict] = []
         for display, original, hid in self._name_elements(elements):
             inner = _element_inner(original)
@@ -719,8 +708,3 @@ def _skip_then_read_stream(resp: requests.Response, skip: int, length: int) -> b
         chunks.append(chunk[offset : offset + take])
         remaining_read -= take
     return b"".join(chunks)
-
-
-# Register the protocol entry point at import time as well, so direct imports
-# work even when the package metadata has not been loaded.
-fsspec.register_implementation("galaxy", GalaxyFileSystem, clobber=True)

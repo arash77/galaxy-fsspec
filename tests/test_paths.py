@@ -5,7 +5,6 @@ from __future__ import annotations
 from galaxy_fsspec.paths import (
     dedupe_names,
     name_with_prefix,
-    parse_numbered_name,
     sanitize_segment,
 )
 
@@ -32,24 +31,6 @@ class TestNameWithPrefix:
 
     def test_no_hid_no_prefix(self):
         assert name_with_prefix(None, "x", numbered=True) == "x"
-
-
-class TestParseNumbered:
-    def test_plain(self):
-        assert parse_numbered_name("30-my result") == (30, "my result")
-
-    def test_leading_dash_in_name_preserved(self):
-        assert parse_numbered_name("1-foo-bar") == (1, "foo-bar")
-
-    def test_no_prefix(self):
-        assert parse_numbered_name("foo") == (None, "foo")
-
-    def test_empty(self):
-        assert parse_numbered_name("") == (None, "")
-
-    def test_non_digit_head(self):
-        # "abc-foo" -> no numeric prefix
-        assert parse_numbered_name("abc-foo") == (None, "abc-foo")
 
 
 class TestDedupe:

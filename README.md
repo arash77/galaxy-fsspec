@@ -59,17 +59,20 @@ import fsspec
 
 fs = fsspec.filesystem("galaxy")
 
-# List histories.
-for h in fs.ls("histories", detail=True):
-    print(h["name"])
+# ls returns entry dicts, as fsspec does everywhere else.
+for h in fs.ls("histories"):
+    print(h["name"], h["type"])
 
-# Timestamps are fetched lazily via info(), or as datetimes via
-# fs.created() / fs.modified().
-for h in fs.ls("histories", detail=True):
+# Pass detail=False when you only want the paths.
+print(fs.ls("histories", detail=False))
+
+# Timestamps come back as datetimes.
+for h in fs.ls("histories"):
     print(h["name"], fs.created(h["name"]), fs.modified(h["name"]))
 
 # Walk a history's contents — datasets are files, collections are folders.
-print(fs.ls("histories/My History", detail=False))
+for entry in fs.ls("histories/My History"):
+    print(entry["type"], entry["name"])
 
 # Read a dataset (range-aware streaming via Galaxy's display endpoint).
 with fs.open("histories/My History/my-paired/forward", "rb") as f:

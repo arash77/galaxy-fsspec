@@ -41,6 +41,10 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.6",
     "mypy>=1.11",
+    # tomllib arrived in 3.11, and 3.10 is the version this package promises to
+    # support. Without this the test pinning the version against pyproject.toml
+    # skips on the one Python most likely to break.
+    "tomli>=2.0; python_version < '3.11'",
 ]
 
 [tool.hatch.build.targets.wheel]
