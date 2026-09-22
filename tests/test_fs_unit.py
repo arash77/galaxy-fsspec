@@ -241,7 +241,6 @@ def _store():
 def make_fs(store=None, **kwargs):
     kwargs.setdefault("url", "https://galaxy.example")
     kwargs.setdefault("api_key", "test-key")
-    kwargs.setdefault("skip_instance_cache", True)
     filesystem = GalaxyFileSystem(**kwargs)
     filesystem.gi = FakeGalaxyInstance(_store() if store is None else store)
     return filesystem
@@ -556,8 +555,9 @@ class TestDownloads:
             ("/api/datasets/ds1/inner", True),
             ("https://objects.example/signed", False),
             ("http://galaxy.example/plain", False),
+            ("https://evil.com\\@galaxy.example/steal", False),
         ],
-        ids=["same-origin", "object-store", "downgrade"],
+        ids=["same-origin", "object-store", "downgrade", "disguised-host"],
     )
     def test_the_key_only_follows_a_redirect_to_galaxy(self, fs, monkeypatch, location, gets_key):
         transport = _use_transport(
@@ -572,10 +572,22 @@ class TestDownloads:
         assert all(call["allow_redirects"] is False for call in transport.calls)
         assert all(response.closed for response in transport.responses)
 
+    def test_galaxys_own_upgrade_to_https_keeps_the_key(self, monkeypatch):
+        fs = make_fs(url="http://galaxy.example")
+        transport = _use_transport(
+            monkeypatch,
+            RecordingTransport(
+                FakeResponse(301, headers={"Location": "https://galaxy.example/x"}),
+                FakeResponse(206, b"HELLO"),
+            ),
+        )
+        fs._download_range("ds1", 0, 5)
+        assert transport.calls[1]["headers"]["x-api-key"] == "test-key"
+
     @pytest.mark.parametrize(
         "location",
-        [None, "file:///etc/passwd", "https://galaxy.example/loop"],
-        ids=["no-location", "not-http", "loop"],
+        [None, "file:///etc/passwd", "http://[", "https://galaxy.example/loop"],
+        ids=["no-location", "not-http", "unparsable", "loop"],
     )
     def test_a_bad_redirect_is_refused(self, fs, monkeypatch, location):
         headers = {} if location is None else {"Location": location}
@@ -668,6 +680,31 @@ class TestNames:
         assert fs.ls("histories/hid2", detail=False) == ["histories/hid2/second-dataset"]
         assert fs.ls("libraries/lib2", detail=False) == ["libraries/lib2/other.txt"]
 
+    def test_the_names_do_not_depend_on_galaxys_order(self):
+        store = _store_with_namesakes()
+        fs = make_fs(store)
+        listed = fs.ls("histories", detail=False)
+        before = {path: fs.ls(path, detail=False) for path in listed}
+        store["histories"].reverse()
+        fs._clear_cache()
+        assert {path: fs.ls(path, detail=False) for path in listed} == before
+
+    def test_library_namesakes_each_get_a_path(self):
+        store = _store()
+        store["libraries"][0]["contents"] += [
+            {
+                "id": "dsX",
+                "type": "file",
+                "name": "/reads.fastq",
+                "ldda_id": "lddaX",
+                "file_size": 9,
+            },
+        ]
+        fs = make_fs(store)
+        entries = fs.ls("libraries/Shared Data", detail=True)
+        assert len({entry["name"] for entry in entries}) == len(entries)
+        assert {"dsL2", "dsX"} <= {entry.get("library_dataset_id") for entry in entries}
+
 
 class TestCollectionsAndLibraries:
     def test_a_nested_collection_reports_its_own_type(self, fs):
@@ -696,6 +733,20 @@ class TestTimestamps:
 
 
 class TestConstruction:
+    def test_to_json_can_leave_the_key_out(self):
+        fs = make_fs(api_key="SECRET")
+        assert "SECRET" not in fs.to_json(include_password=False)
+        assert fs.to_dict()["api_key"] == "SECRET"
+
+    def test_callers_with_different_keys_do_not_share_an_instance(self, monkeypatch):
+        monkeypatch.setenv("GALAXY_URL", "https://galaxy.example")
+        monkeypatch.setenv("GALAXY_USER_API_KEY", "key-a")
+        first = GalaxyFileSystem()
+        monkeypatch.setenv("GALAXY_USER_API_KEY", "key-b")
+        second = GalaxyFileSystem()
+        assert first is not second
+        assert second._key == "key-b"
+
     def test_walk_skips_a_directory_it_cannot_list(self, fs):
         """Every error is an OSError, which fsspec's walk skips instead of aborting on."""
         original = fs._list

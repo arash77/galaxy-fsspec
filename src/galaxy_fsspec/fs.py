@@ -10,6 +10,7 @@ from typing import Any, Literal
 
 import requests
 from fsspec.spec import AbstractFileSystem
+from requests import PreparedRequest
 
 from galaxy_fsspec.client import build_galaxy_instance, show_hid_in_names_from_env
 from galaxy_fsspec.exceptions import GalaxyApiError, NotFoundError, ReadOnlyError
@@ -51,6 +52,9 @@ class GalaxyFileSystem(AbstractFileSystem):
 
     protocol = "galaxy"
     root_marker = ""
+    # fsspec tokenizes arguments before __init__ reads the key from the environment, so two
+    # callers with different keys would otherwise share one instance.
+    cachable = False
 
     def __init__(
         self,
@@ -67,8 +71,8 @@ class GalaxyFileSystem(AbstractFileSystem):
         # build by hand has to agree with the ones bioblend makes.
         self._url: str = str(self.gi.base_url)
         self._key: str = str(api_key or self.gi.key)
-        # Only this exact origin may receive the Galaxy API key.
-        self._origin: tuple[str, str] = _origin(self._url)
+        # Only this origin may receive the Galaxy API key.
+        self._origin: tuple[str, str, int | None] = _origin(self._url)
         self.show_hid_in_names: bool = (
             show_hid_in_names if show_hid_in_names is not None else show_hid_in_names_from_env()
         )
@@ -100,6 +104,13 @@ class GalaxyFileSystem(AbstractFileSystem):
         entries = self._list(path)
         self._dir_cache[path] = (entries, time.time())
         return entries
+
+    def to_dict(self, *, include_password: bool = True) -> dict[str, Any]:
+        """Serialise the filesystem; ``include_password=False`` also drops ``api_key``."""
+        serialised = super().to_dict(include_password=include_password)
+        if not include_password:
+            serialised.pop("api_key", None)
+        return serialised
 
     def info(self, path: str, **kwargs: Any) -> dict:
         return self._info(path, **kwargs)
@@ -432,8 +443,8 @@ class GalaxyFileSystem(AbstractFileSystem):
         flat = self._library_flat_contents(library["id"])
         # Build the Galaxy-side prefix.  Root is "/", a sub-folder is "/seg1/seg2".
         prefix = "/" + "/".join(segments) if segments else "/"
-        entries: list[dict] = []
         child_prefix = prefix if prefix.endswith("/") else f"{prefix}/"
+        children: list[tuple[str, dict]] = []
         for item in flat:
             name = item.get("name", "")
             if name == "/" or not (name == prefix or name.startswith(child_prefix)):
@@ -442,16 +453,38 @@ class GalaxyFileSystem(AbstractFileSystem):
             remainder = name[1:] if prefix == "/" else name[len(prefix) + 1 :]
             if not remainder or "/" in remainder:
                 continue  # skip self and nested descendants
+            children.append((remainder, item))
+
+        # Uploading the same file twice gives one folder two datasets with the
+        # same name, and without this they share a path: the second is
+        # unreachable and the first is served twice. Folders are left alone
+        # because descent rebuilds the Galaxy-side path from these names, and
+        # the flat contents endpoint cannot tell two same-named folders apart
+        # in the first place.
+        deduped = iter(
+            name
+            for name, _ in dedupe_names(
+                [
+                    {"name": remainder, "id": item.get("id")}
+                    for remainder, item in children
+                    if item.get("type") != "folder"
+                ],
+                numbered=False,
+            )
+        )
+
+        entries: list[dict] = []
+        for remainder, item in children:
             is_folder = item.get("type") == "folder"
+            display = remainder if is_folder else next(deduped)
             entry: dict = {
-                "name": f"{path}/{remainder}",
+                "name": f"{path}/{display}",
                 "type": "directory" if is_folder else "file",
+                "size": 0,
             }
             if is_folder:
-                entry["size"] = 0
                 entry["library_folder_id"] = item["id"]
             else:
-                entry["size"] = 0
                 entry["library_dataset_id"] = item["id"]
                 entry["library_id"] = library["id"]
             entries.append(entry)
@@ -615,6 +648,22 @@ class GalaxyFileSystem(AbstractFileSystem):
             url += f"?hda_ldda={hda_ldda}"
         return self._download_from_url(url, start, end, dataset_id)
 
+    def _is_galaxy_origin(self, url: str) -> bool:
+        """Whether ``url`` may be sent the Galaxy API key: the Galaxy origin, or the same host
+        upgraded from http to https."""
+        scheme, host, port = _origin(url)
+        galaxy_scheme, galaxy_host, galaxy_port = self._origin
+        if not host or host != galaxy_host:
+            return False
+        if (scheme, port) == (galaxy_scheme, galaxy_port):
+            return True
+        return (
+            galaxy_scheme == "http"
+            and scheme == "https"
+            and galaxy_port == _DEFAULT_PORTS["http"]
+            and port == _DEFAULT_PORTS["https"]
+        )
+
     def _request_range(self, url: str, start: int, end: int) -> requests.Response:
         """GET ``[start, end)`` of ``url``, following redirects by hand.
 
@@ -623,8 +672,11 @@ class GalaxyFileSystem(AbstractFileSystem):
         """
         range_header = f"bytes={start}-{end - 1}"
         for _hop in range(_MAX_REDIRECTS + 1):
+            # Normalise before deciding anything about this URL: a redirect target
+            # is Galaxy's word, not ours.
+            url = _as_requests_will_fetch(url)
             headers = {"Range": range_header}
-            if _origin(url) == self._origin:
+            if self._is_galaxy_origin(url):
                 headers["x-api-key"] = self._key
             resp = requests.get(
                 url,
@@ -639,8 +691,14 @@ class GalaxyFileSystem(AbstractFileSystem):
             resp.close()
             if not location:
                 raise GalaxyApiError(f"redirect from {url} carried no Location header")
-            url = urllib.parse.urljoin(url, location)
-            if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
+            try:
+                url = urllib.parse.urljoin(url, location)
+                scheme = urllib.parse.urlsplit(url).scheme
+            except ValueError as exc:
+                raise GalaxyApiError(
+                    f"refusing to follow an unparsable redirect to {location!r}: {exc}"
+                ) from exc
+            if scheme not in ("http", "https"):
                 raise GalaxyApiError(f"refusing to follow redirect to {url!r}")
         raise GalaxyApiError(
             f"too many redirects (>{_MAX_REDIRECTS}) while downloading {url}"
@@ -663,14 +721,38 @@ class GalaxyFileSystem(AbstractFileSystem):
             resp.close()
 
 
-def _origin(url: str) -> tuple[str, str]:
-    """Return the ``(scheme, netloc)`` origin of ``url``, lowercased.
+_DEFAULT_PORTS = {"http": 80, "https": 443}
 
-    Scheme and port are part of the identity: ``http://host`` is not the same
-    origin as ``https://host``.
+
+def _as_requests_will_fetch(url: str) -> str:
+    """Return the URL ``requests`` will actually fetch, so the origin check judges that one.
+
+    urllib and urllib3 disagree about a backslash in the authority: ``https://evil.com\\@galaxy.example/``
+    is galaxy.example to one and evil.com to the other.
+    """
+    prepared = PreparedRequest()
+    try:
+        prepared.prepare_url(url, None)
+    except Exception as exc:
+        raise GalaxyApiError(f"refusing to fetch an unparsable URL {url!r}: {exc}") from exc
+    if not prepared.url:
+        raise GalaxyApiError(f"refusing to fetch an unparsable URL {url!r}")
+    return str(prepared.url)
+
+
+def _origin(url: str) -> tuple[str, str, int | None]:
+    """Return the ``(scheme, host, port)`` origin of ``url``, lowercased.
+
+    The port is resolved to its default for the scheme, so ``https://host`` and
+    ``https://host:443`` compare equal.
     """
     parsed = urllib.parse.urlsplit(url)
-    return parsed.scheme.lower(), parsed.netloc.lower()
+    scheme = parsed.scheme.lower()
+    try:
+        port = parsed.port
+    except ValueError:  # malformed port
+        port = None
+    return scheme, (parsed.hostname or "").lower(), port or _DEFAULT_PORTS.get(scheme)
 
 
 def _to_int(value: Any) -> int | None:

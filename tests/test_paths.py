@@ -47,8 +47,7 @@ class TestDedupe:
         ]
         out = dedupe_names(items, numbered=True)
         names = [n for n, _ in out]
-        assert names[0] == "1-dup"
-        assert names[1].startswith("1-dup__")
+        assert all(n.startswith("1-dup__") for n in names)
         assert names[0] != names[1]
 
     def test_collision_unnumbered(self):
@@ -58,11 +57,19 @@ class TestDedupe:
         ]
         out = dedupe_names(items, numbered=False)
         names = [n for n, _ in out]
-        assert names[0] == "dup"
-        assert names[1].startswith("dup__")
+        assert all(n.startswith("dup__") for n in names)
         assert names[0] != names[1]
 
     def test_preserves_order(self):
         items = [{"id": "1", "name": "z", "hid": 5}, {"id": "2", "name": "a", "hid": 1}]
         out = dedupe_names(items, numbered=False)
         assert [i["id"] for _, i in out] == ["1", "2"]
+
+    def test_collision_naming_does_not_depend_on_order(self):
+        """Galaxy orders /api/histories by update_time, so the same two objects
+        arrive in either order. The name each one gets must not change."""
+        a = {"id": "abc123def456", "name": "dup"}
+        b = {"id": "xyz789abc012", "name": "dup"}
+        forward = {item["id"]: name for name, item in dedupe_names([a, b], numbered=False)}
+        backward = {item["id"]: name for name, item in dedupe_names([b, a], numbered=False)}
+        assert forward == backward

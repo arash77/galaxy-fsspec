@@ -37,22 +37,34 @@ def dedupe_names(items: list[dict], numbered: bool) -> list[tuple[str, dict]]:
     """Assign unique display names to a list of Galaxy content dicts.
 
     Returns a list of ``(display_name, original_dict)`` preserving input order.
-    Collisions are broken by appending ``__<short_id>`` of the object id.
+
+    A name that occurs once is used as-is. When a name occurs more than once,
+    *every* member of that group is suffixed with ``__<short_id>``, not just the
+    later ones. Galaxy orders ``/api/histories`` by update time, so the same two
+    histories arrive in either order from one call to the next; suffixing only
+    the later ones would move the unsuffixed name between them, and a path that
+    ``ls()`` has already handed out would start naming a different object.
     """
-    seen: dict[str, int] = {}
+    bases = [
+        name_with_prefix(_item_hid(item), _item_name(item), numbered) for item in items
+    ]
+    counts: dict[str, int] = {}
+    for base in bases:
+        counts[base] = counts.get(base, 0) + 1
+
     out: list[tuple[str, dict]] = []
-    for item in items:
-        hid = _item_hid(item)
-        base = name_with_prefix(hid, _item_name(item), numbered)
-        candidate = base
-        if candidate in seen:
-            short = _short_id(_item_id(item))
-            candidate = f"{base}__{short}"
-        # If even the suffixed name collided, keep appending until unique.
-        while candidate in seen:
-            seen[candidate] += 1
-            candidate = f"{base}__{seen[candidate]}"
-        seen[candidate] = 0
+    used: set[str] = set()
+    for base, item in zip(bases, items, strict=True):
+        candidate = base if counts[base] == 1 else f"{base}__{_short_id(_item_id(item))}"
+        # Two ids can still share a short suffix, and an item can be named like
+        # another's suffixed form. Rare, and order-dependent, but it must not
+        # produce a duplicate path.
+        if candidate in used:
+            suffix = 2
+            while f"{candidate}__{suffix}" in used:
+                suffix += 1
+            candidate = f"{candidate}__{suffix}"
+        used.add(candidate)
         out.append((candidate, item))
     return out
 
