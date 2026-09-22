@@ -14,7 +14,6 @@ keywords = ["galaxy", "fsspec", "bioblend", "filesystem"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.12",
@@ -26,9 +25,6 @@ dependencies = [
     "bioblend>=0.22.0",
     "requests>=2.31",
 ]
-
-[project.optional-dependencies]
-async = ["fsspec>=2024.1.0"]
 
 [project.entry-points."fsspec.specs"]
 galaxy = "galaxy_fsspec.fs:GalaxyFileSystem"
@@ -43,11 +39,20 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.6",
     "mypy>=1.11",
-    "respx>=0.21",
 ]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/galaxy_fsspec"]
+
+[tool.hatch.build.targets.sdist]
+# Keep the tests, so the archive can be verified on its own. Leave out the
+# things that only make sense in a git checkout.
+include = [
+    "src",
+    "tests",
+    "README.md",
+    "LICENSE",
+]
 
 [tool.ruff]
 line-length = 100
