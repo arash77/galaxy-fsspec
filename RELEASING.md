@@ -38,8 +38,11 @@ These steps are done once, by a repository maintainer, before the first release.
 ## Cutting a release
 
 1. Open a pull request that sets `version` in `pyproject.toml` to the new
-   version and nothing else. Nothing else in the repository needs editing:
-   `__version__` is read from the installed distribution metadata.
+   version, then run `uv lock` and commit the updated `uv.lock` alongside it.
+   `uv.lock` records the root project's own version, so a bump without it
+   fails `uv sync --locked` in CI and again in the release build. Nothing else
+   needs editing: `__version__` is read from the installed distribution
+   metadata.
 2. Merge it once CI is green.
 3. Tag that exact commit `vX.Y.Z` and push the tag.
 4. Publish a GitHub release for the tag. Leave "set as a pre-release"

@@ -1,5 +1,8 @@
 [build-system]
-requires = ["hatchling>=1.21"]
+# 1.27 is the first release that emits a PEP 639 License-Expression. Below it
+# the build silently produces Metadata 2.3 with a free-text License field, which
+# the publish workflow's license check then reports as "no license at all".
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
@@ -81,7 +84,10 @@ files = ["src/galaxy_fsspec"]
 [tool.pytest.ini_options]
 minversion = "8.0"
 testpaths = ["tests"]
-addopts = "-ra --strict-markers --cov=galaxy_fsspec --cov-report=term-missing"
+# Coverage is a CI concern, not a property of the test suite: baking --cov into
+# addopts makes the shipped tests unrunnable without pytest-cov, and makes every
+# later pytest invocation rewrite .coverage.
+addopts = "-ra --strict-markers"
 markers = [
     "integration: tests that hit a live Galaxy instance (require GALAXY_USER_API_KEY)",
 ]

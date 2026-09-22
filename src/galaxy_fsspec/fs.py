@@ -62,7 +62,10 @@ class GalaxyFileSystem(AbstractFileSystem):
     ) -> None:
         super().__init__(**kwargs)
         self.gi = build_galaxy_instance(url=url, api_key=api_key)
-        self._url: str = str(url or self.gi.base_url)
+        # Always the normalised URL, never the raw argument: bioblend strips a
+        # trailing slash and supplies a missing scheme, and every request we
+        # build by hand has to agree with the ones bioblend makes.
+        self._url: str = str(self.gi.base_url)
         self._key: str = str(api_key or self.gi.key)
         # Only this exact origin may receive the Galaxy API key.
         self._origin: tuple[str, str] = _origin(self._url)
@@ -113,12 +116,23 @@ class GalaxyFileSystem(AbstractFileSystem):
         value = self._info(path).get(key)
         if not value:
             raise GalaxyApiError(f"Galaxy reported no {key} for {path!r}")
+        text = str(value)
+        # Python 3.10's fromisoformat rejects a trailing "Z", which Galaxy emits
+        # whenever its timestamps are serialised as timezone-aware.
+        if text[-1:] in ("Z", "z"):
+            text = f"{text[:-1]}+00:00"
         try:
-            return dt.datetime.fromisoformat(str(value))
+            parsed = dt.datetime.fromisoformat(text)
         except ValueError as exc:
             raise GalaxyApiError(
                 f"Galaxy reported an unparsable {key} for {path!r}: {value!r}"
             ) from exc
+        # Galaxy records these in UTC and serialises them without an offset, so
+        # a naive value is UTC. Returning it aware is what fsspec callers expect
+        # and is the difference between comparing against now() and a TypeError.
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return parsed
 
     def _info(self, path: str, **kwargs: Any) -> dict:
         path = self._strip_protocol(path)
@@ -447,9 +461,20 @@ class GalaxyFileSystem(AbstractFileSystem):
     # History contents
     # ------------------------------------------------------------------ #
 
+    #: The summary listing has no ``file_size``. ``details`` brings it back; ``keys=[...]`` does
+    #: not, because Galaxy ignores it.
+    _CONTENTS_DETAILS = "all"
+
+    def _history_contents(self, history_id: str) -> list[dict]:
+        """Return a history's contents, with sizes, in one request."""
+        return list(
+            self.gi.histories.show_history(
+                history_id, contents=True, details=self._CONTENTS_DETAILS
+            )
+        )
+
     def _list_history_contents(self, history: dict, path: str) -> list[dict]:
-        hid = history["id"]
-        contents = self.gi.histories.show_history(hid, contents=True)
+        contents = self._history_contents(history["id"])
         return self._contents_to_entries(contents, path)
 
     def _contents_to_entries(
@@ -484,7 +509,7 @@ class GalaxyFileSystem(AbstractFileSystem):
         ``segments`` is everything below the history folder; ``segments[0]`` is a
         top-level collection, any later segments descend into nested collections.
         """
-        contents = self.gi.histories.show_history(history["id"], contents=True)
+        contents = self._history_contents(history["id"])
         current = self._resolve_in_contents(contents, segments[0])
         if not current.get("_is_collection"):
             # A top-level dataset has no children.
@@ -562,7 +587,7 @@ class GalaxyFileSystem(AbstractFileSystem):
             if is_collection:
                 entry["size"] = 0
                 entry["collection_id"] = inner.get("id")
-                entry["collection_type"] = (inner.get("object") or {}).get("collection_type")
+                entry["collection_type"] = inner.get("collection_type")
             else:
                 entry["size"] = _to_int(inner.get("file_size") or inner.get("size")) or 0
                 entry["dataset_id"] = inner.get("id")

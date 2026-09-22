@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import datetime as _dt
+
 import pytest
 
 from galaxy_fsspec.exceptions import GalaxyApiError, NotFoundError, ReadOnlyError
@@ -326,13 +328,20 @@ class TestHistoryContents:
     def test_dataset_info(self, fs):
         info = fs.info("histories/History A/my-uploaded-dataset")
         assert info["type"] == "file"
-        # Pins a defect, not a requirement. The listing endpoint does not return
-        # file_size, and nothing here asks for it yet, so every dataset reports 0.
-        # The old fake supplied file_size that a real Galaxy never sends, which is
-        # why this read as working.
-        assert info["size"] == 0
+        assert info["size"] == 11
         assert info["dataset_id"] == "ds1"
         assert info["hid"] == 1
+
+    def test_a_listing_reports_the_real_size(self, fs):
+        """Every entry read 0 bytes before, on every real Galaxy.
+
+        The listing endpoint answers with the summary serialization, which has no
+        file_size, so sizes have to be asked for. A file source built on this shows
+        the number from here in its browser, and 0 for every file is what a user saw.
+        """
+        entries = fs.ls("histories/History A", detail=True)
+        dataset = next(e for e in entries if e["type"] == "file")
+        assert dataset["size"] == 11
 
     def test_collection_info(self, fs):
         info = fs.info("histories/History A/my result")
@@ -581,6 +590,13 @@ class TestDownloads:
             fs._download_range("ds1", 0, 5)
         assert transport.responses[0].closed
 
+    def test_a_trailing_slash_in_the_url_is_harmless(self, monkeypatch):
+        fs = make_fs(url="https://galaxy.example/")
+        transport = _use_transport(monkeypatch, RecordingTransport(FakeResponse(206, b"HELLO")))
+        fs._download_range("ds1", 0, 5)
+        assert transport.calls[0]["url"] == "https://galaxy.example/api/datasets/ds1/display"
+        assert transport.calls[0]["headers"]["x-api-key"] == "test-key"
+
 
 class TestReading:
     """A read returns the whole dataset, or says why it cannot."""
@@ -653,7 +669,27 @@ class TestNames:
         assert fs.ls("libraries/lib2", detail=False) == ["libraries/lib2/other.txt"]
 
 
+class TestCollectionsAndLibraries:
+    def test_a_nested_collection_reports_its_own_type(self, fs):
+        entries = fs.ls("histories/History A/my result", detail=True)
+        assert [entry["collection_type"] for entry in entries] == ["paired"]
+
+
 class TestTimestamps:
+    @pytest.mark.parametrize(
+        ("stamp", "microsecond"),
+        [
+            ("2024-01-02T03:04:05", 0),
+            ("2024-01-02T03:04:05Z", 0),
+            ("2024-01-02T03:04:05.123456Z", 123456),
+        ],
+    )
+    def test_every_spelling_galaxy_sends_parses(self, stamp, microsecond):
+        store = _store()
+        store["histories"][0]["create_time"] = stamp
+        created = make_fs(store).created("histories/History A")
+        assert created == _dt.datetime(2024, 1, 2, 3, 4, 5, microsecond, tzinfo=_dt.timezone.utc)
+
     def test_a_missing_date_is_an_error(self, fs):
         with pytest.raises(GalaxyApiError):
             fs.modified("histories/History A/my result/sample1/forward")

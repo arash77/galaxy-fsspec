@@ -56,7 +56,7 @@ jobs:
         run: uv run mypy src
 
       - name: Unit tests
-        run: uv run pytest -m "not integration"
+        run: uv run pytest -m "not integration" --cov=galaxy_fsspec --cov-report=term-missing
 
       # Catches import/collection errors in the live suite without a Galaxy key.
       - name: Collect integration tests
