@@ -16,7 +16,6 @@ from galaxy_fsspec.exceptions import GalaxyApiError, NotFoundError, ReadOnlyErro
 from galaxy_fsspec.file import GalaxyFile
 from galaxy_fsspec.paths import (
     dedupe_names,
-    name_with_prefix,
     sanitize_segment,
 )
 
@@ -24,6 +23,8 @@ ROOT = ""
 HISTORIES_DIR = "histories"
 LIBRARIES_DIR = "libraries"
 _CACHE_TTL = 60.0  # seconds
+_MAX_REDIRECTS = 5
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
 
 class GalaxyFileSystem(AbstractFileSystem):
@@ -63,6 +64,8 @@ class GalaxyFileSystem(AbstractFileSystem):
         self.gi = build_galaxy_instance(url=url, api_key=api_key)
         self._url: str = str(url or self.gi.base_url)
         self._key: str = str(api_key or self.gi.key)
+        # Only this exact origin may receive the Galaxy API key.
+        self._origin: tuple[str, str] = _origin(self._url)
         self.show_hid_in_names: bool = (
             show_hid_in_names if show_hid_in_names is not None else show_hid_in_names_from_env()
         )
@@ -319,15 +322,16 @@ class GalaxyFileSystem(AbstractFileSystem):
 
     def _resolve_history(self, segment: str) -> dict:
         histories = self.gi.histories.get_histories()
-        for h in histories:
-            disp = name_with_prefix(None, h.get("name") or h["id"], self.show_hid_in_names)
-            # Histories have no hid; numbered prefix not applied, so compare by full name.
-            if segment == disp:
+        # Resolve through the same deduplicated display names _list_histories
+        # emits, so every path returned by ls() can be browsed.
+        named = dedupe_names(histories, numbered=self.show_hid_in_names)
+        for display, h in named:
+            if segment == display:
                 return h
-            # Fall back to matching by raw name or id.
-            if segment == sanitize_segment(h.get("name") or "") or segment == h["id"]:
+        # Fall back to the raw (possibly ambiguous) name, then the raw id.
+        for _display, h in named:
+            if segment == sanitize_segment(h.get("name") or ""):
                 return h
-        # Allow lookup by raw id.
         for h in histories:
             if h["id"] == segment:
                 return h
@@ -354,11 +358,13 @@ class GalaxyFileSystem(AbstractFileSystem):
 
     def _resolve_library(self, segment: str) -> dict:
         libraries = self.gi.libraries.get_libraries()
-        for lib in libraries:
-            disp = name_with_prefix(None, lib.get("name") or lib["id"], False)
-            if segment == disp:
+        # Mirror _list_libraries: libraries have no hid, so never numbered.
+        named = dedupe_names(libraries, numbered=False)
+        for display, lib in named:
+            if segment == display:
                 return lib
-            if segment == sanitize_segment(lib.get("name") or "") or segment == lib["id"]:
+        for _display, lib in named:
+            if segment == sanitize_segment(lib.get("name") or ""):
                 return lib
         for lib in libraries:
             if lib["id"] == segment:
@@ -391,9 +397,10 @@ class GalaxyFileSystem(AbstractFileSystem):
         # Build the Galaxy-side prefix.  Root is "/", a sub-folder is "/seg1/seg2".
         prefix = "/" + "/".join(segments) if segments else "/"
         entries: list[dict] = []
+        child_prefix = prefix if prefix.endswith("/") else f"{prefix}/"
         for item in flat:
             name = item.get("name", "")
-            if name == "/" or not name.startswith(prefix):
+            if name == "/" or not (name == prefix or name.startswith(child_prefix)):
                 continue
             # Remainder after the prefix.
             remainder = name[1:] if prefix == "/" else name[len(prefix) + 1 :]
@@ -565,19 +572,62 @@ class GalaxyFileSystem(AbstractFileSystem):
             url += f"?hda_ldda={hda_ldda}"
         return self._download_from_url(url, start, end, dataset_id)
 
+    def _request_range(self, url: str, start: int, end: int) -> requests.Response:
+        """GET ``[start, end)`` of ``url``, following redirects by hand.
+
+        requests keeps a custom header like ``x-api-key`` across a redirect to another host, so each
+        hop decides again whether the key may go.
+        """
+        range_header = f"bytes={start}-{end - 1}"
+        for _hop in range(_MAX_REDIRECTS + 1):
+            headers = {"Range": range_header}
+            if _origin(url) == self._origin:
+                headers["x-api-key"] = self._key
+            resp = requests.get(
+                url,
+                headers=headers,
+                timeout=60,
+                stream=True,
+                allow_redirects=False,
+            )
+            if resp.status_code not in _REDIRECT_STATUSES:
+                return resp
+            location = resp.headers.get("Location")
+            resp.close()
+            if not location:
+                raise GalaxyApiError(f"redirect from {url} carried no Location header")
+            url = urllib.parse.urljoin(url, location)
+            if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
+                raise GalaxyApiError(f"refusing to follow redirect to {url!r}")
+        raise GalaxyApiError(
+            f"too many redirects (>{_MAX_REDIRECTS}) while downloading {url}"
+        )
+
     def _download_from_url(
         self, url: str, start: int, end: int, label: str
     ) -> bytes:
         length = end - start
-        headers = {"x-api-key": self._key, "Range": f"bytes={start}-{end - 1}"}
-        resp = requests.get(url, headers=headers, timeout=60, stream=True)
-        if resp.status_code == 206:
-            return _read_stream(resp, length)
-        if resp.status_code == 200:
-            return _skip_then_read_stream(resp, start, length)
-        if resp.status_code in (401, 403):
-            raise ReadOnlyError(f"Galaxy refused dataset access: {resp.status_code}")
-        raise NotFoundError(f"dataset {label} (HTTP {resp.status_code})")
+        resp = self._request_range(url, start, end)
+        try:
+            if resp.status_code == 206:
+                return _read_stream(resp, length)
+            if resp.status_code == 200:
+                return _skip_then_read_stream(resp, start, length)
+            if resp.status_code in (401, 403):
+                raise ReadOnlyError(f"Galaxy refused dataset access: {resp.status_code}")
+            raise NotFoundError(f"dataset {label} (HTTP {resp.status_code})")
+        finally:
+            resp.close()
+
+
+def _origin(url: str) -> tuple[str, str]:
+    """Return the ``(scheme, netloc)`` origin of ``url``, lowercased.
+
+    Scheme and port are part of the identity: ``http://host`` is not the same
+    origin as ``https://host``.
+    """
+    parsed = urllib.parse.urlsplit(url)
+    return parsed.scheme.lower(), parsed.netloc.lower()
 
 
 def _to_int(value: Any) -> int | None:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from galaxy_fsspec.exceptions import GalaxyApiError
+from galaxy_fsspec.exceptions import GalaxyApiError, NotFoundError, ReadOnlyError
 from galaxy_fsspec.fs import GalaxyFileSystem
 
 
@@ -228,6 +228,8 @@ def _store():
                      "ldda_id": "ldda1", "file_size": 14},
                     {"id": "dsL2", "type": "file", "name": "/reads.fastq",
                      "ldda_id": "ldda2", "file_size": 10},
+                    {"id": "dsL3", "type": "file", "name": "/genomes.txt",
+                     "ldda_id": "ldda3", "file_size": 5},
                 ],
             }
         ],
@@ -241,6 +243,45 @@ def make_fs(store=None, **kwargs):
     filesystem = GalaxyFileSystem(**kwargs)
     filesystem.gi = FakeGalaxyInstance(_store() if store is None else store)
     return filesystem
+
+
+def _store_with_namesakes():
+    """A second history and a second library, each named like the first."""
+    store = _store()
+    store["histories"].append(
+        {
+            "id": "hid2",
+            "name": "History A",
+            "create_time": "2024-02-01T00:00:00",
+            "update_time": "2024-02-02T00:00:00",
+            "contents": [
+                {
+                    "id": "ds2",
+                    "hid": 1,
+                    "name": "second-dataset",
+                    "history_content_type": "dataset",
+                    "file_size": 7,
+                }
+            ],
+        }
+    )
+    store["libraries"].append(
+        {
+            "id": "lib2",
+            "name": "Shared Data",
+            "contents": [
+                {"id": "f_root2", "type": "folder", "name": "/"},
+                {
+                    "id": "dsL9",
+                    "type": "file",
+                    "name": "/other.txt",
+                    "ldda_id": "ldda9",
+                    "file_size": 3,
+                },
+            ],
+        }
+    )
+    return store
 
 
 @pytest.fixture
@@ -438,7 +479,7 @@ class TestLibraryContents:
 
     def test_list_nested_folder(self, fs):
         names = fs.ls("libraries/Shared Data/genomes")
-        assert "libraries/Shared Data/genomes/hg38.fa" in names
+        assert names == ["libraries/Shared Data/genomes/hg38.fa"]
 
     def test_nested_dataset_info(self, fs):
         info = fs.info("libraries/Shared Data/genomes/hg38.fa")
@@ -477,6 +518,50 @@ class TestLibraryNotFound:
 
 
 LEAF = "histories/History A/my result/sample1/forward"
+
+
+class TestDownloads:
+    """Redirects are followed by hand, so the API key only ever goes to Galaxy."""
+
+    @pytest.mark.parametrize(
+        ("location", "gets_key"),
+        [
+            ("/api/datasets/ds1/inner", True),
+            ("https://objects.example/signed", False),
+            ("http://galaxy.example/plain", False),
+        ],
+        ids=["same-origin", "object-store", "downgrade"],
+    )
+    def test_the_key_only_follows_a_redirect_to_galaxy(self, fs, monkeypatch, location, gets_key):
+        transport = _use_transport(
+            monkeypatch,
+            RecordingTransport(
+                FakeResponse(302, headers={"Location": location}), FakeResponse(206, b"HELLO")
+            ),
+        )
+        assert fs._download_range("ds1", 0, 5) == b"HELLO"
+        assert ("x-api-key" in transport.calls[1]["headers"]) is gets_key
+        assert transport.calls[1]["headers"]["Range"] == "bytes=0-4"
+        assert all(call["allow_redirects"] is False for call in transport.calls)
+        assert all(response.closed for response in transport.responses)
+
+    @pytest.mark.parametrize(
+        "location",
+        [None, "file:///etc/passwd", "https://galaxy.example/loop"],
+        ids=["no-location", "not-http", "loop"],
+    )
+    def test_a_bad_redirect_is_refused(self, fs, monkeypatch, location):
+        headers = {} if location is None else {"Location": location}
+        _use_transport(monkeypatch, RecordingTransport(*[FakeResponse(302, headers=headers)] * 10))
+        with pytest.raises(GalaxyApiError):
+            fs._download_range("ds1", 0, 5)
+
+    @pytest.mark.parametrize(("status", "error"), [(403, ReadOnlyError), (500, NotFoundError)])
+    def test_an_error_response_is_closed(self, fs, monkeypatch, status, error):
+        transport = _use_transport(monkeypatch, RecordingTransport(FakeResponse(status)))
+        with pytest.raises(error):
+            fs._download_range("ds1", 0, 5)
+        assert transport.responses[0].closed
 
 
 class TestReading:
@@ -526,3 +611,18 @@ class TestReading:
         }
         with pytest.raises(GalaxyApiError):
             fs.open("libraries/Shared Data/genomes/hg38.fa", "rb")
+
+
+class TestNames:
+    """Every path ls() gives out opens the object it named, and only that one."""
+
+    def test_namesakes_each_open_their_own(self):
+        fs = make_fs(_store_with_namesakes())
+        first, second = fs.ls("histories", detail=False)
+        assert f"{first}/my-uploaded-dataset" in fs.ls(first, detail=False)
+        assert f"{second}/second-dataset" in fs.ls(second, detail=False)
+        one, two = fs.ls("libraries", detail=False)
+        assert f"{one}/reads.fastq" in fs.ls(one, detail=False)
+        assert f"{two}/other.txt" in fs.ls(two, detail=False)
+        assert fs.ls("histories/hid2", detail=False) == ["histories/hid2/second-dataset"]
+        assert fs.ls("libraries/lib2", detail=False) == ["libraries/lib2/other.txt"]
