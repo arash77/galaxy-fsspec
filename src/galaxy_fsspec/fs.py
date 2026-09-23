@@ -189,9 +189,7 @@ class GalaxyFileSystem(AbstractFileSystem):
         info = self._info(path)
         if info["type"] != "file":
             raise IsADirectoryError(path)
-        # Dataset leaves inside collections and library folders are listed with
-        # size 0 because the listing endpoints don't report file_size. Fetch the
-        # real size here so AbstractBufferedFile.read() actually returns bytes.
+        # A listed size of 0 means empty or not known; the details say which.
         if info.get("size", 0) == 0:
             if "library_dataset_id" in info:
                 ldda_id, size = self._library_dataset_details(
@@ -465,72 +463,90 @@ class GalaxyFileSystem(AbstractFileSystem):
         """List the root folder of a library."""
         return self._list_library_path(library, [], path)
 
-    def _library_flat_contents(self, library_id: str) -> list[dict]:
-        """Return the flat contents of a library, cached with TTL."""
-        cached = self._library_flat_cache.get(library_id)
-        if cached is not None and self._cache_ok() and not self._cache_expired(cached[1]):
-            return cached[0]
-        flat = self.gi.libraries.show_library(library_id, contents=True)
-        if self._cache_ok():
-            self._library_flat_cache[library_id] = (flat, time.time())
-        return flat
+    def _folder_contents(self, folder_id: str) -> list[dict]:
+        """Return one folder's contents, every page of it; ``show_folder`` stops at ten."""
+        return list(self.gi.folders.contents_iter(folder_id))
+
+    def _library_root_folder_id(self, library: dict) -> str:
+        folder_id = library.get("root_folder_id")
+        if not folder_id:
+            raise GalaxyApiError(
+                f"Galaxy did not say which folder library {library.get('id')!r} starts at"
+            )
+        return str(folder_id)
 
     def _list_library_path(self, library: dict, segments: list[str], path: str) -> list[dict]:
-        """List contents at a path within a library.
+        """List one folder inside a library, walking the folders API from the library root."""
+        folder_id = self._library_root_folder_id(library)
+        walked: list[str] = []
+        for segment in segments:
+            children = self._folder_contents(folder_id)
+            match = self._match_folder_child(children, segment, walked, path)
+            folder_id = str(match["id"])
+            walked.append(segment)
+        return self._folder_entries(self._folder_contents(folder_id), library, path)
 
-        Galaxy's ``show_library(contents=True)`` returns a flat list of every
-        item with full paths (e.g. ``/folder/dataset.ext``).  We cache that
-        flat list per library so browsing nested folders doesn't re-fetch it.
+    def _match_folder_child(
+        self, children: list[dict], segment: str, walked: list[str], path: str
+    ) -> dict:
+        """Find the sub-folder a path segment names."""
+        folders = [child for child in children if child.get("type") == "folder"]
+        named = dedupe_names(folders, numbered=False)
+        for display, child in named:
+            if display == segment:
+                return child
+        matched = [
+            (display, child)
+            for display, child in named
+            if segment == sanitize_segment(child.get("name") or "")
+        ]
+        if len(matched) == 1:
+            return matched[0][1]
+        if matched:
+            raise NotFoundError(_ambiguous(path, matched))
+        raise NotFoundError(path)
+
+    def _folder_entries(self, children: list[dict], library: dict, path: str) -> list[dict]:
+        """Turn one folder's contents into fsspec entries.
+
+        Uploading the same file twice gives one folder two datasets with the same name, and Galaxy
+        also permits a dataset named like a sibling folder. Either way they would share a path: one
+        becomes unreachable and the other is served twice. Names are deduplicated across every
+        child so a file can see a folder it clashes with, but folders keep the plain name, because
+        descending rebuilds the path from the displayed folder names and a renamed one could not
+        then be entered.
         """
-        flat = self._library_flat_contents(library["id"])
-        # Build the Galaxy-side prefix.  Root is "/", a sub-folder is "/seg1/seg2".
-        prefix = "/" + "/".join(segments) if segments else "/"
-        child_prefix = prefix if prefix.endswith("/") else f"{prefix}/"
-        children: list[tuple[str, dict]] = []
-        for item in flat:
-            name = item.get("name", "")
-            if name == "/" or not (name == prefix or name.startswith(child_prefix)):
-                continue
-            # Remainder after the prefix.
-            remainder = name[1:] if prefix == "/" else name[len(prefix) + 1 :]
-            if not remainder or "/" in remainder:
-                continue  # skip self and nested descendants
-            children.append((remainder, item))
-
-        # Uploading the same file twice gives one folder two datasets with the
-        # same name, and Galaxy also permits a dataset named like a sibling
-        # folder. Either way they would share a path: one becomes unreachable
-        # and the other is served twice.
-        #
-        # Deduplicate across every child, so a file can see a folder it clashes
-        # with, but let folders keep the plain name: descending into a library
-        # rebuilds the Galaxy-side path from the displayed folder names, so a
-        # renamed folder could not be entered. Two folders with one name stay
-        # ambiguous, because the flat contents endpoint gives them the same
-        # path and offers nothing to tell them apart.
         deduped = iter(
-            name
-            for name, _ in dedupe_names(
-                [{"name": remainder, "id": item.get("id")} for remainder, item in children],
+            display
+            for display, _ in dedupe_names(
+                [{"name": c.get("name") or "", "id": c.get("id")} for c in children],
                 numbered=False,
             )
         )
-
         entries: list[dict] = []
-        for remainder, item in children:
-            is_folder = item.get("type") == "folder"
+        for child in children:
+            is_folder = child.get("type") == "folder"
             candidate = next(deduped)
-            display = remainder if is_folder else candidate
+            display = sanitize_segment(child.get("name") or "") if is_folder else candidate
             entry: dict = {
                 "name": f"{path}/{display}",
                 "type": "directory" if is_folder else "file",
-                "size": 0,
+                # raw_size, never file_size: that one is a human readable string from nice_size.
+                "size": 0 if is_folder else _to_int(child.get("raw_size")) or 0,
             }
+            created = child.get("create_time")
+            changed = child.get("update_time")
+            if created:
+                entry["created"] = created
+            if changed:
+                entry["mtime"] = changed
             if is_folder:
-                entry["library_folder_id"] = item["id"]
+                entry["library_folder_id"] = child["id"]
             else:
-                entry["library_dataset_id"] = item["id"]
+                entry["library_dataset_id"] = child["id"]
                 entry["library_id"] = library["id"]
+                if child.get("ldda_id"):
+                    entry["ldda_id"] = child["ldda_id"]
             entries.append(entry)
         return entries
 
@@ -564,6 +580,13 @@ class GalaxyFileSystem(AbstractFileSystem):
                 "type": "directory" if is_collection else "file",
                 "hid": _to_int(item.get("hid")),
             }
+            # The listing carries these already, no detail request needed for them. Galaxy's own
+            # fsspec file source reads mtime and never last_modified, so an entry without it shows
+            # no date at all in the file browser.
+            if item.get("create_time"):
+                entry["created"] = item["create_time"]
+            if item.get("update_time"):
+                entry["mtime"] = item["update_time"]
             if is_collection:
                 entry["size"] = 0
                 entry["collection_id"] = item["id"]

@@ -143,7 +143,11 @@ class FakeLibraries:
         self.store = store
 
     def get_libraries(self):
-        return [{"id": lib["id"], "name": lib["name"]} for lib in self.store["libraries"]]
+        # The real payload carries root_folder_id, which is where browsing starts.
+        return [
+            {"id": lib["id"], "name": lib["name"], "root_folder_id": f"F{lib['id']}:/"}
+            for lib in self.store["libraries"]
+        ]
 
     def show_library(self, library_id, contents=False):
         lib = next(lb for lb in self.store["libraries"] if lb["id"] == library_id)
@@ -178,6 +182,82 @@ class FakeLibraries:
         }
 
 
+class FakeFolders:
+    """``/api/folders/{folder_id}/contents``.
+
+    The real endpoint lists one folder, not the whole library, and every file carries ``raw_size``
+    plus timestamps. ``file_size`` is a human readable string from ``nice_size``, so a fake that
+    served an integer there would hide the code reading the wrong field.
+
+    Folder ids here are ``F<library id>:<path>``, which is only a way to address a folder in the
+    flat store. A real id is opaque and the code must not read anything out of it.
+    """
+
+    def __init__(self, store):
+        self.store = store
+
+    @staticmethod
+    def _nice(size):
+        return f"{size} bytes"
+
+    def _split(self, folder_id):
+        library_id, _, prefix = str(folder_id).partition(":")
+        return library_id[1:], prefix or "/"
+
+    def show_folder(self, folder_id, contents=False, limit=10, offset=0, include_deleted=False):
+        if not contents:
+            return {"id": folder_id}
+        items = self._children(folder_id)
+        return {"folder_contents": items[offset : offset + limit]}
+
+    def contents_iter(self, folder_id, batch_size=10, include_deleted=False):
+        # bioblend pages; the code under test must not assume one page holds everything.
+        items = self._children(folder_id)
+        for start in range(0, max(len(items), 1), batch_size):
+            yield from items[start : start + batch_size]
+
+    def _children(self, folder_id):
+        library_id, prefix = self._split(folder_id)
+        lib = next((lb for lb in self.store["libraries"] if lb["id"] == library_id), None)
+        if lib is None:
+            raise ConnectionError(f"Unexpected HTTP status code: 404 ({folder_id})")
+        child_prefix = prefix if prefix.endswith("/") else f"{prefix}/"
+        out = []
+        for item in lib["contents"]:
+            name = item.get("name", "")
+            if name == "/" or not name.startswith(child_prefix):
+                continue
+            remainder = name[len(child_prefix) :]
+            if not remainder or "/" in remainder:
+                continue
+            if item.get("type") == "folder":
+                out.append(
+                    {
+                        "id": f"F{library_id}:{name}",
+                        "type": "folder",
+                        "name": remainder,
+                        "create_time": "2024-01-01T00:00:00",
+                        "update_time": "2024-01-02T00:00:00",
+                    }
+                )
+            else:
+                size = item.get("file_size", 0)
+                out.append(
+                    {
+                        "id": item["id"],
+                        "type": "file",
+                        "name": remainder,
+                        "raw_size": size,
+                        "file_size": self._nice(size),
+                        "ldda_id": item.get("ldda_id"),
+                        "state": item.get("state", "ok"),
+                        "create_time": "2024-01-01T00:00:00",
+                        "update_time": "2024-01-02T00:00:00",
+                    }
+                )
+        return out
+
+
 class FakeGalaxyInstance:
     def __init__(self, store):
         self.base_url = "https://galaxy.example"
@@ -186,6 +266,7 @@ class FakeGalaxyInstance:
         self.dataset_collections = FakeDatasetCollections(store)
         self.datasets = FakeDatasets(store)
         self.libraries = FakeLibraries(store)
+        self.folders = FakeFolders(store)
 
 
 class FakeResponse:
@@ -265,6 +346,8 @@ def _store():
                         "name": "my-uploaded-dataset",
                         "history_content_type": "dataset",
                         "file_size": 11,
+                        "create_time": "2024-03-01T00:00:00",
+                        "update_time": "2024-03-02T00:00:00",
                     },
                     {
                         "id": "coll1",
@@ -312,6 +395,14 @@ def _store():
                 "contents": [
                     {"id": "f_root", "type": "folder", "name": "/"},
                     {"id": "f1", "type": "folder", "name": "/genomes"},
+                    # 0 bytes, so a listing reports no size and _open has to ask.
+                    {
+                        "id": "dsEmpty",
+                        "type": "file",
+                        "name": "/empty.txt",
+                        "ldda_id": "lddaEmpty",
+                        "file_size": 0,
+                    },
                     {
                         "id": "dsL1",
                         "type": "file",
@@ -596,7 +687,7 @@ class TestLibraryContents:
     def test_library_folder_info(self, fs):
         info = fs.info("libraries/Shared Data/genomes")
         assert info["type"] == "directory"
-        assert info["library_folder_id"] == "f1"
+        assert info["library_folder_id"], "a folder entry has to carry an id to descend with"
 
     def test_library_dataset_info(self, fs):
         info = fs.info("libraries/Shared Data/reads.fastq")
@@ -731,7 +822,7 @@ class TestReading:
 
         fs.gi.datasets.show_dataset = boom
         fs.gi.libraries.show_dataset = boom
-        for path in (LEAF, "libraries/Shared Data/genomes/hg38.fa"):
+        for path in (LEAF, "libraries/Shared Data/empty.txt"):
             with pytest.raises(GalaxyApiError) as excinfo:
                 fs.open(path, "rb")
             assert excinfo.value.__cause__ is cause
@@ -772,7 +863,7 @@ class TestReading:
             "state": "ok",
         }
         with pytest.raises(GalaxyApiError):
-            fs.open("libraries/Shared Data/genomes/hg38.fa", "rb")
+            fs.open("libraries/Shared Data/empty.txt", "rb")
 
 
 class TestNames:
@@ -835,6 +926,28 @@ class TestCollectionsAndLibraries:
 
         fs.gi.dataset_collections.show_dataset_collection = refuse
         assert fs.ls("histories/History A/my result/sample1", detail=False)
+
+    def test_library_files_list_their_real_size_and_dates(self, fs):
+        entry = fs.info("libraries/Shared Data/genomes/hg38.fa")
+        assert entry["size"] == 14
+        assert entry["mtime"] and entry["created"]
+
+    def test_every_page_of_a_large_folder_is_listed(self):
+        """show_folder stops at ten; the paging iterator does not."""
+        store = _store()
+        store["libraries"][0]["contents"] += [
+            {"id": "fmany", "type": "folder", "name": "/many"}
+        ] + [
+            {
+                "id": f"dsBig{i}",
+                "type": "file",
+                "name": f"/many/file{i:03d}.txt",
+                "ldda_id": f"lddaBig{i}",
+                "file_size": i + 1,
+            }
+            for i in range(25)
+        ]
+        assert len(make_fs(store).ls("libraries/Shared Data/many", detail=False)) == 25
 
 
 class TestTimestamps:

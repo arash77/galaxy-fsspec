@@ -29,10 +29,9 @@ dependencies = [
     # 2024.9.0 is the first release whose AbstractFileSystem.to_dict takes
     # include_password, which the credential redaction builds on.
     "fsspec>=2024.9.0",
-    # 1.2.0 is the first release whose GalaxyInstance.base_url strips a
-    # trailing slash. Below it every hand-built download URL doubles the
-    # separator and every read 404s.
-    "bioblend>=1.2.0",
+    # 1.5.0 is the first release with FoldersClient.contents_iter, which
+    # library browsing needs.
+    "bioblend>=1.5.0",
     "requests>=2.31",
 ]
 
