@@ -6,6 +6,7 @@ import datetime as _dt
 
 import pytest
 
+from galaxy_fsspec.client import DEFAULT_TIMEOUT
 from galaxy_fsspec.exceptions import GalaxyApiError, NotFoundError, ReadOnlyError
 from galaxy_fsspec.fs import GalaxyFileSystem
 
@@ -162,11 +163,7 @@ class FakeLibraries:
         """
         lib = next(lb for lb in self.store["libraries"] if lb["id"] == library_id)
         item = next(
-            (
-                c
-                for c in lib["contents"]
-                if c.get("type") == "file" and c.get("id") == dataset_id
-            ),
+            (c for c in lib["contents"] if c.get("type") == "file" and c.get("id") == dataset_id),
             None,
         )
         if item is None:
@@ -239,9 +236,7 @@ class ByteRangeTransport:
 
     def get(self, url, headers=None, timeout=None, stream=False, allow_redirects=True):
         headers = dict(headers or {})
-        self.calls.append(
-            {"url": url, "headers": headers, "allow_redirects": allow_redirects}
-        )
+        self.calls.append({"url": url, "headers": headers, "allow_redirects": allow_redirects})
         start, end = headers["Range"].removeprefix("bytes=").split("-")
         response = FakeResponse(206, self.payload[int(start) : int(end) + 1])
         self.responses.append(response)
@@ -317,12 +312,27 @@ def _store():
                 "contents": [
                     {"id": "f_root", "type": "folder", "name": "/"},
                     {"id": "f1", "type": "folder", "name": "/genomes"},
-                    {"id": "dsL1", "type": "file", "name": "/genomes/hg38.fa",
-                     "ldda_id": "ldda1", "file_size": 14},
-                    {"id": "dsL2", "type": "file", "name": "/reads.fastq",
-                     "ldda_id": "ldda2", "file_size": 10},
-                    {"id": "dsL3", "type": "file", "name": "/genomes.txt",
-                     "ldda_id": "ldda3", "file_size": 5},
+                    {
+                        "id": "dsL1",
+                        "type": "file",
+                        "name": "/genomes/hg38.fa",
+                        "ldda_id": "ldda1",
+                        "file_size": 14,
+                    },
+                    {
+                        "id": "dsL2",
+                        "type": "file",
+                        "name": "/reads.fastq",
+                        "ldda_id": "ldda2",
+                        "file_size": 10,
+                    },
+                    {
+                        "id": "dsL3",
+                        "type": "file",
+                        "name": "/genomes.txt",
+                        "ldda_id": "ldda3",
+                        "file_size": 5,
+                    },
                 ],
             }
         ],
@@ -785,7 +795,7 @@ class TestNames:
         listed = fs.ls("histories", detail=False)
         before = {path: fs.ls(path, detail=False) for path in listed}
         store["histories"].reverse()
-        fs._clear_cache()
+        fs.invalidate_cache()
         assert {path: fs.ls(path, detail=False) for path in listed} == before
 
     @pytest.mark.parametrize("path", ["histories/History A", "libraries/Shared Data"])
@@ -847,6 +857,48 @@ class TestTimestamps:
             fs.modified("histories/History A/my result/sample1/forward")
 
 
+class TestCaching:
+    @staticmethod
+    def _count_history_listings(fs):
+        calls = []
+        original = fs.gi.histories.get_histories
+
+        def counting(*args, **kwargs):
+            calls.append(1)
+            return original(*args, **kwargs)
+
+        fs.gi.histories.get_histories = counting
+        return calls
+
+    @pytest.mark.parametrize(
+        ("options", "fetches"),
+        [({}, 1), ({"use_listings_cache": False}, 2), ({"listings_expiry_time": 0}, 2)],
+    )
+    def test_listings_follow_fsspecs_cache_options(self, options, fetches):
+        fs = make_fs(**options)
+        calls = self._count_history_listings(fs)
+        assert fs.ls("histories") and fs.ls("histories")
+        assert len(calls) == fetches
+
+    def test_invalidate_cache_empties_what_it_is_asked_to(self):
+        fs = make_fs()
+        calls = self._count_history_listings(fs)
+        fs.ls("histories")
+        fs.ls("libraries")
+        fs.invalidate_cache("libraries")
+        fs.ls("histories")
+        assert len(calls) == 1
+        fs.invalidate_cache()
+        fs.ls("histories")
+        assert len(calls) == 2
+
+    def test_reading_does_not_depend_on_the_cache(self, monkeypatch):
+        fs = make_fs(use_listings_cache=False)
+        fs.gi.datasets.store["dataset_sizes"] = {"dsF": 10}
+        _use_transport(monkeypatch, ByteRangeTransport(b"R1CONTENT!"))
+        assert fs.cat_file(LEAF) == b"R1CONTENT!"
+
+
 class TestConstruction:
     def test_to_json_can_leave_the_key_out(self):
         fs = make_fs(api_key="SECRET")
@@ -866,6 +918,15 @@ class TestConstruction:
         second = GalaxyFileSystem()
         assert first is not second
         assert second._key == "key-b"
+
+    def test_every_galaxy_call_times_out(self):
+        assert (
+            GalaxyFileSystem(url="https://galaxy.example", api_key="k").gi.timeout
+            == DEFAULT_TIMEOUT
+        )
+        assert (
+            GalaxyFileSystem(url="https://galaxy.example", api_key="k", timeout=5).gi.timeout == 5
+        )
 
     def test_walk_skips_a_directory_it_cannot_list(self, fs):
         """Every error is an OSError, which fsspec's walk skips instead of aborting on."""

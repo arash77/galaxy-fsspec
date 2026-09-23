@@ -24,15 +24,13 @@ pytestmark = pytest.mark.integration
 @pytest.fixture(scope="module")
 def fs():
     filesystem = GalaxyFileSystem()  # reads GALAXY_URL + GALAXY_USER_API_KEY
-    filesystem._clear_cache()
+    filesystem.invalidate_cache()
     return filesystem
 
 
 @pytest.fixture(scope="module")
 def seeded_history(fs):
-    gi = GalaxyInstance(
-        url=os.environ["GALAXY_URL"], key=os.environ["GALAXY_USER_API_KEY"]
-    )
+    gi = GalaxyInstance(url=os.environ["GALAXY_URL"], key=os.environ["GALAXY_USER_API_KEY"])
     name = f"galaxy-fsspec-test-{uuid.uuid4().hex[:8]}"
     hist_id = gi.histories.create_history(name=name)["id"]
     try:
@@ -60,13 +58,13 @@ def seeded_history(fs):
 
 
 def test_histories_listed(fs, seeded_history):
-    fs._clear_cache()
+    fs.invalidate_cache()
     names = fs.ls("histories", detail=False)
     assert any(n.endswith(seeded_history) or "galaxy-fsspec-test" in n for n in names), names
 
 
 def test_history_contents_and_collection(fs, seeded_history):
-    fs._clear_cache()
+    fs.invalidate_cache()
     # Find our history folder by name.
     entries = fs.ls("histories", detail=True)
     ours = next(e for e in entries if e.get("history_id") == seeded_history)
@@ -89,7 +87,7 @@ def test_history_contents_and_collection(fs, seeded_history):
 
 
 def test_read_dataset_bytes(fs, seeded_history):
-    fs._clear_cache()
+    fs.invalidate_cache()
     entries = fs.ls("histories", detail=True)
     ours = next(e for e in entries if e.get("history_id") == seeded_history)
     children = fs.ls(ours["name"], detail=True)
@@ -109,15 +107,11 @@ def library_with_file():
     ideal for testing library browsing and downloads without walking
     deep folder trees.
     """
-    gi = GalaxyInstance(
-        url=os.environ["GALAXY_URL"], key=os.environ["GALAXY_USER_API_KEY"]
-    )
+    gi = GalaxyInstance(url=os.environ["GALAXY_URL"], key=os.environ["GALAXY_USER_API_KEY"])
     libraries = gi.libraries.get_libraries(deleted=False)
 
     # Prefer "Charts Example Data" (small, flat, public on usegalaxy.org).
-    preferred = [
-        lib for lib in libraries if "charts" in lib.get("name", "").lower()
-    ]
+    preferred = [lib for lib in libraries if "charts" in lib.get("name", "").lower()]
     candidates = preferred or libraries
     if not candidates:
         pytest.skip("No accessible data libraries on this Galaxy instance")
@@ -128,22 +122,24 @@ def library_with_file():
         if files:
             # Prefer bacteriome.txt; fall back to shallowest file.
             bacteriome = [f for f in files if "bacteriome" in f.get("name", "")]
-            target = bacteriome[0] if bacteriome else min(
-                files, key=lambda f: f.get("name", "").count("/")
+            target = (
+                bacteriome[0]
+                if bacteriome
+                else min(files, key=lambda f: f.get("name", "").count("/"))
             )
             return lib["id"], target["name"]
     pytest.skip("No accessible library contains readable files")
 
 
 def test_libraries_listed(fs):
-    fs._clear_cache()
+    fs.invalidate_cache()
     names = fs.ls("libraries", detail=False)
     assert len(names) > 0
 
 
 def test_library_browse_and_read(fs, library_with_file):
     lib_id, galaxy_path = library_with_file
-    fs._clear_cache()
+    fs.invalidate_cache()
 
     # Find the library folder in the fsspec tree.
     entries = fs.ls("libraries", detail=True)
@@ -160,9 +156,7 @@ def test_library_browse_and_read(fs, library_with_file):
         parent = f"{ours['name']}/" + "/".join(parts[: i + 1])
         children = fs.ls(parent, detail=True)
         child_name = f"{ours['name']}/" + "/".join(parts[: i + 2])
-        assert any(c["name"] == child_name for c in children), (
-            f"{child_name} not found in {parent}"
-        )
+        assert any(c["name"] == child_name for c in children), f"{child_name} not found in {parent}"
 
     # Read the file.
     info = fs.info(file_path)

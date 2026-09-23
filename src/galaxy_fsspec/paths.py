@@ -45,9 +45,7 @@ def dedupe_names(items: list[dict], numbered: bool) -> list[tuple[str, dict]]:
     the later ones would move the unsuffixed name between them, and a path that
     ``ls()`` has already handed out would start naming a different object.
     """
-    bases = [
-        name_with_prefix(_item_hid(item), _item_name(item), numbered) for item in items
-    ]
+    bases = [name_with_prefix(_item_hid(item), _item_name(item), numbered) for item in items]
     counts: dict[str, int] = {}
     for base in bases:
         counts[base] = counts.get(base, 0) + 1

@@ -6,13 +6,17 @@ import datetime as dt
 import time
 import urllib.parse
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, cast
 
 import requests
 from fsspec.spec import AbstractFileSystem
 from requests import PreparedRequest
 
-from galaxy_fsspec.client import build_galaxy_instance, show_hid_in_names_from_env
+from galaxy_fsspec.client import (
+    DEFAULT_TIMEOUT,
+    build_galaxy_instance,
+    show_hid_in_names_from_env,
+)
 from galaxy_fsspec.exceptions import GalaxyApiError, NotFoundError, ReadOnlyError
 from galaxy_fsspec.file import GalaxyFile
 from galaxy_fsspec.paths import (
@@ -23,7 +27,6 @@ from galaxy_fsspec.paths import (
 ROOT = ""
 HISTORIES_DIR = "histories"
 LIBRARIES_DIR = "libraries"
-_CACHE_TTL = 60.0  # seconds
 _MAX_REDIRECTS = 5
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
@@ -62,11 +65,12 @@ class GalaxyFileSystem(AbstractFileSystem):
         url: str | None = None,
         api_key: str | None = None,
         show_hid_in_names: bool | None = None,
-        cache_ttl: float = _CACHE_TTL,
+        timeout: float | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
-        self.gi = build_galaxy_instance(url=url, api_key=api_key)
+        self.timeout: float = DEFAULT_TIMEOUT if timeout is None else float(timeout)
+        self.gi = build_galaxy_instance(url=url, api_key=api_key, timeout=self.timeout)
         # Always the normalised URL, never the raw argument: bioblend strips a
         # trailing slash and supplies a missing scheme, and every request we
         # build by hand has to agree with the ones bioblend makes.
@@ -77,13 +81,10 @@ class GalaxyFileSystem(AbstractFileSystem):
         self.show_hid_in_names: bool = (
             show_hid_in_names if show_hid_in_names is not None else show_hid_in_names_from_env()
         )
-        self._cache_ttl = float(cache_ttl)
-        # path -> (entries, timestamp)  for directory listings
-        self._dir_cache: dict[str, tuple[list[dict], float]] = {}
-        # path -> info dict
+        # Listings live in self.dircache, which honours fsspec's cache options.
+        # path -> info dict, carrying the size _open resolved
         self._info_cache: dict[str, dict] = {}
-        # library_id -> (flat_contents, timestamp) — avoids re-fetching the
-        # full library tree on every folder listing within the same library.
+        # library_id -> (flat_contents, timestamp), so one library tree is fetched once per listing
         self._library_flat_cache: dict[str, tuple[list[dict], float]] = {}
 
     # ------------------------------------------------------------------ #
@@ -99,11 +100,13 @@ class GalaxyFileSystem(AbstractFileSystem):
 
     def _ls(self, path: str) -> list[dict]:
         path = self._strip_protocol(path)
-        cached = self._cached_dir(path)
+        cached = self.dircache.get(path)
         if cached is not None:
-            return cached
+            return cast(list[dict], cached)
         entries = self._list(path)
-        self._dir_cache[path] = (entries, time.time())
+        # Keep what was just built rather than reading it back. With caching off, or an entry
+        # already expired, the write keeps nothing and the read raises KeyError.
+        self.dircache[path] = entries
         return entries
 
     def to_dict(self, *, include_password: bool = True) -> dict[str, Any]:
@@ -148,7 +151,7 @@ class GalaxyFileSystem(AbstractFileSystem):
 
     def _info(self, path: str, **kwargs: Any) -> dict:
         path = self._strip_protocol(path)
-        if path in self._info_cache:
+        if self._cache_ok() and path in self._info_cache:
             return self._info_cache[path]
         if path == ROOT:
             return {"name": ROOT, "size": 0, "type": "directory"}
@@ -197,13 +200,15 @@ class GalaxyFileSystem(AbstractFileSystem):
                 info = {**info, "size": size, "ldda_id": ldda_id}
             else:
                 info = {**info, "size": self._dataset_details(info.get("dataset_id"))}
-            self._info_cache[path] = info
+            if self._cache_ok():
+                self._info_cache[path] = info
         return GalaxyFile(
             self,
             path,
             mode="rb",
             block_size=block_size or (8 << 20),
             cache_type=cache_type,
+            details=info,
             **kwargs,
         )
 
@@ -260,13 +265,12 @@ class GalaxyFileSystem(AbstractFileSystem):
             )
         return str(ldda_id), size
 
-    def _fetch_dataset_range(self, path: str, start: int, end: int) -> bytes:
-        info = self._info(path)
+    def _fetch_dataset_range(self, info: dict, start: int, end: int) -> bytes:
         if "ldda_id" in info:
             return self._download_range(info["ldda_id"], start, end, hda_ldda="ldda")
         dataset_id = info.get("dataset_id")
         if not dataset_id:
-            raise GalaxyApiError(f"no Galaxy dataset id is known for {path!r}")
+            raise GalaxyApiError(f"no Galaxy dataset id is known for {info.get('name')!r}")
         return self._download_range(dataset_id, start, end)
 
     # Read-only enforcement -------------------------------------------------
@@ -313,18 +317,31 @@ class GalaxyFileSystem(AbstractFileSystem):
         stripped = super()._strip_protocol(path)
         return stripped.lstrip("/") or ROOT
 
-    def _cached_dir(self, path: str) -> list[dict] | None:
-        if path in self._dir_cache:
-            entries, ts = self._dir_cache[path]
-            if time.time() - ts < self._cache_ttl:
-                return entries
-            del self._dir_cache[path]
-        return None
-
-    def _clear_cache(self) -> None:
-        self._dir_cache.clear()
-        self._info_cache.clear()
+    def invalidate_cache(self, path: str | None = None) -> None:
+        """Empty the caches at or under ``path``, or all of them; the base class empties nothing."""
+        super().invalidate_cache(path)
+        if path is None:
+            self.dircache.clear()
+            self._info_cache.clear()
+            self._library_flat_cache.clear()
+            return
+        # "at or under given path", per the base class contract.
+        prefix = self._strip_protocol(path)
+        for cached in [p for p in list(self.dircache) if p == prefix or p.startswith(f"{prefix}/")]:
+            del self.dircache[cached]
+        for cached in [p for p in self._info_cache if p == prefix or p.startswith(f"{prefix}/")]:
+            del self._info_cache[cached]
+        # A library's flat contents are keyed by library id rather than by path, and one listing
+        # under the given path may have come from any of them, so they all go.
         self._library_flat_cache.clear()
+
+    def _cache_ok(self) -> bool:
+        """Whether the caches that are not ``dircache`` may answer at all."""
+        return bool(self.dircache.use_listings_cache)
+
+    def _cache_expired(self, stamped_at: float) -> bool:
+        expiry = self.dircache.listings_expiry_time
+        return expiry is not None and (time.time() - stamped_at) >= expiry
 
     def _list(self, path: str) -> list[dict]:
         if path == ROOT:
@@ -393,9 +410,7 @@ class GalaxyFileSystem(AbstractFileSystem):
         # Then the raw name, which the display form may have numbered, and
         # finally the raw id.
         matched = [
-            (display, h)
-            for display, h in named
-            if segment == sanitize_segment(h.get("name") or "")
+            (display, h) for display, h in named if segment == sanitize_segment(h.get("name") or "")
         ]
         if len(matched) == 1:
             return matched[0][1]
@@ -453,15 +468,14 @@ class GalaxyFileSystem(AbstractFileSystem):
     def _library_flat_contents(self, library_id: str) -> list[dict]:
         """Return the flat contents of a library, cached with TTL."""
         cached = self._library_flat_cache.get(library_id)
-        if cached is not None and time.time() - cached[1] < self._cache_ttl:
+        if cached is not None and self._cache_ok() and not self._cache_expired(cached[1]):
             return cached[0]
         flat = self.gi.libraries.show_library(library_id, contents=True)
-        self._library_flat_cache[library_id] = (flat, time.time())
+        if self._cache_ok():
+            self._library_flat_cache[library_id] = (flat, time.time())
         return flat
 
-    def _list_library_path(
-        self, library: dict, segments: list[str], path: str
-    ) -> list[dict]:
+    def _list_library_path(self, library: dict, segments: list[str], path: str) -> list[dict]:
         """List contents at a path within a library.
 
         Galaxy's ``show_library(contents=True)`` returns a flat list of every
@@ -497,10 +511,7 @@ class GalaxyFileSystem(AbstractFileSystem):
         deduped = iter(
             name
             for name, _ in dedupe_names(
-                [
-                    {"name": remainder, "id": item.get("id")}
-                    for remainder, item in children
-                ],
+                [{"name": remainder, "id": item.get("id")} for remainder, item in children],
                 numbered=False,
             )
         )
@@ -543,9 +554,7 @@ class GalaxyFileSystem(AbstractFileSystem):
         contents = self._history_contents(history["id"])
         return self._contents_to_entries(contents, path)
 
-    def _contents_to_entries(
-        self, contents: Iterable[dict], parent_path: str
-    ) -> list[dict]:
+    def _contents_to_entries(self, contents: Iterable[dict], parent_path: str) -> list[dict]:
         named = dedupe_names(list(contents), numbered=self.show_hid_in_names)
         entries: list[dict] = []
         for display, item in named:
@@ -735,7 +744,7 @@ class GalaxyFileSystem(AbstractFileSystem):
             resp = requests.get(
                 url,
                 headers=headers,
-                timeout=60,
+                timeout=self.timeout,
                 stream=True,
                 allow_redirects=False,
             )
@@ -754,13 +763,9 @@ class GalaxyFileSystem(AbstractFileSystem):
                 ) from exc
             if scheme not in ("http", "https"):
                 raise GalaxyApiError(f"refusing to follow redirect to {url!r}")
-        raise GalaxyApiError(
-            f"too many redirects (>{_MAX_REDIRECTS}) while downloading {url}"
-        )
+        raise GalaxyApiError(f"too many redirects (>{_MAX_REDIRECTS}) while downloading {url}")
 
-    def _download_from_url(
-        self, url: str, start: int, end: int, label: str
-    ) -> bytes:
+    def _download_from_url(self, url: str, start: int, end: int, label: str) -> bytes:
         length = end - start
         resp = self._request_range(url, start, end)
         try:
@@ -813,10 +818,7 @@ def _ambiguous(path: str, matched: list[tuple[str, dict]]) -> str:
     """Message for a plain name that more than one object answers to; picking one would depend
     on the order Galaxy lists them in."""
     offered = ", ".join(sorted(display for display, _item in matched))
-    return (
-        f"{path} is ambiguous: {len(matched)} objects share that name. "
-        f"Use one of: {offered}"
-    )
+    return f"{path} is ambiguous: {len(matched)} objects share that name. Use one of: {offered}"
 
 
 def _to_int(value: Any) -> int | None:
