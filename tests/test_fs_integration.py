@@ -132,9 +132,16 @@ def library_with_file():
 
 
 def test_libraries_listed(fs):
+    """A Galaxy with no data libraries is a normal Galaxy, not a failure.
+
+    A fresh or private server often has none, so this checks the listing works rather than that
+    the server has content, the same way the browse test below already does.
+    """
     fs.invalidate_cache()
     names = fs.ls("libraries", detail=False)
-    assert len(names) > 0
+    if not names:
+        pytest.skip("No accessible data libraries on this Galaxy instance")
+    assert all(name.startswith("libraries/") for name in names)
 
 
 def test_library_browse_and_read(fs, library_with_file):

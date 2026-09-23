@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import datetime as _dt
+import time
 
 import pytest
 
 from galaxy_fsspec.client import DEFAULT_TIMEOUT
 from galaxy_fsspec.exceptions import GalaxyApiError, NotFoundError, ReadOnlyError
 from galaxy_fsspec.fs import GalaxyFileSystem
+
+_EPOCH_2024_01_01 = _dt.datetime(2024, 1, 1, tzinfo=_dt.timezone.utc).timestamp()
+_EPOCH_2024_01_02 = _dt.datetime(2024, 1, 2, tzinfo=_dt.timezone.utc).timestamp()
 
 
 class FakeHistories:
@@ -505,8 +509,8 @@ class TestHistories:
     def test_history_info_has_dates(self, fs):
         info = fs.info("histories/History A")
         assert info["type"] == "directory"
-        assert info["created"] == "2024-01-01T00:00:00"
-        assert info["mtime"] == "2024-01-02T00:00:00"
+        assert info["created"] == _EPOCH_2024_01_01
+        assert info["mtime"] == _EPOCH_2024_01_02
         assert info["history_id"] == "hid1"
 
 
@@ -665,7 +669,9 @@ class TestFileRead:
         with fs.open("histories/History A/my result/sample1/forward", "rb") as f:
             assert f.size == 10
             assert f.read() == b"R1CONTENT!"
-        assert transport.calls[0]["url"] == "https://galaxy.example/api/datasets/dsF/display"
+        assert transport.calls[0]["url"] == (
+            "https://galaxy.example/api/datasets/dsF/display?raw=true"
+        )
 
 
 class TestLibrariesRoot:
@@ -713,7 +719,7 @@ class TestLibraryFileRead:
             assert f.size == 14
             assert f.read() == b"GTACGTACGTACGT"
         assert transport.calls[0]["url"] == (
-            "https://galaxy.example/api/datasets/ldda1/display?hda_ldda=ldda"
+            "https://galaxy.example/api/datasets/ldda1/display?raw=true&hda_ldda=ldda"
         )
 
     def test_open_and_read_root_library_dataset(self, fs, monkeypatch):
@@ -789,7 +795,10 @@ class TestDownloads:
         with pytest.raises(GalaxyApiError):
             fs._download_range("ds1", 0, 5)
 
-    @pytest.mark.parametrize(("status", "error"), [(403, ReadOnlyError), (500, NotFoundError)])
+    @pytest.mark.parametrize(
+        ("status", "error"),
+        [(403, ReadOnlyError), (404, NotFoundError), (500, GalaxyApiError)],
+    )
     def test_an_error_response_is_closed(self, fs, monkeypatch, status, error):
         transport = _use_transport(monkeypatch, RecordingTransport(FakeResponse(status)))
         with pytest.raises(error):
@@ -800,7 +809,9 @@ class TestDownloads:
         fs = make_fs(url="https://galaxy.example/")
         transport = _use_transport(monkeypatch, RecordingTransport(FakeResponse(206, b"HELLO")))
         fs._download_range("ds1", 0, 5)
-        assert transport.calls[0]["url"] == "https://galaxy.example/api/datasets/ds1/display"
+        assert transport.calls[0]["url"] == (
+            "https://galaxy.example/api/datasets/ds1/display?raw=true"
+        )
         assert transport.calls[0]["headers"]["x-api-key"] == "test-key"
 
 
@@ -841,6 +852,27 @@ class TestReading:
         else:
             with pytest.raises(GalaxyApiError, match=state):
                 fs.open(LEAF, "rb")
+
+    def test_a_dataset_without_data_is_refused_whatever_size_it_lists(self):
+        """Where jobs write straight into the object store, a running file lists a partial size."""
+        store = _store()
+        store["libraries"][0]["contents"].append(
+            {
+                "id": "dsW",
+                "type": "file",
+                "name": "/growing.txt",
+                "ldda_id": "lddaW",
+                "file_size": 50,
+                "state": "running",
+            }
+        )
+        leaf = store["histories"][0]["contents"][1]["elements"][0]["object"]["elements"][0]
+        leaf["object"].update(file_size=5, state="running")
+        fs = make_fs(store)
+        for path in ("libraries/Shared Data/growing.txt", LEAF):
+            assert fs.info(path)["state"] == "running"
+            with pytest.raises(GalaxyApiError, match="running"):
+                fs.open(path, "rb")
 
     @pytest.mark.parametrize("element", [{"name": "R1"}, {"name": "R1", "file_size": 5}])
     def test_an_entry_without_a_dataset_id_is_an_error(self, monkeypatch, element):
@@ -912,6 +944,18 @@ class TestNames:
         assert {"dsL2", "dsX", "dsG"} <= {entry.get("library_dataset_id") for entry in entries}
         assert fs.info("libraries/Shared Data/genomes")["type"] == "directory"
 
+    def test_two_library_folders_with_one_name_can_both_be_opened(self, fs):
+        children = [
+            {"id": "F1", "type": "folder", "name": "genomes"},
+            {"id": "F2", "type": "folder", "name": "genomes"},
+        ]
+        shown = [
+            e["name"].rsplit("/", 1)[1] for e in fs._folder_entries(children, {"id": "l"}, "p")
+        ]
+        assert len(set(shown)) == 2
+        for name, child in zip(shown, children, strict=True):
+            assert fs._match_folder_child(children, name, [], "p")["id"] == child["id"]
+
 
 class TestCollectionsAndLibraries:
     def test_a_nested_collection_reports_its_own_type(self, fs):
@@ -951,6 +995,21 @@ class TestCollectionsAndLibraries:
 
 
 class TestTimestamps:
+    def test_listed_dates_are_numbers_galaxy_can_format(self, fs):
+        paths = ("histories", "histories/History A", "libraries/Shared Data/genomes")
+        stamps = [
+            entry[key]
+            for path in paths
+            for entry in fs.ls(path, detail=True)
+            for key in ("mtime", "created")
+            if key in entry
+        ]
+        assert stamps
+        for stamp in stamps:
+            # What Galaxy's file source does with the value; a string crashed it.
+            time.strftime("%Y", time.localtime(stamp))
+        assert fs.info("histories/History A")["created"] == _EPOCH_2024_01_01
+
     @pytest.mark.parametrize(
         ("stamp", "microsecond"),
         [

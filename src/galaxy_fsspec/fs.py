@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import datetime as dt
-import time
 import urllib.parse
 from collections.abc import Iterable
 from typing import Any, cast
@@ -29,6 +28,11 @@ HISTORIES_DIR = "histories"
 LIBRARIES_DIR = "libraries"
 _MAX_REDIRECTS = 5
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+# Galaxy's own Dataset.no_data_states. A dataset in one of these can still list a nonzero
+# size, e.g. partial bytes where jobs write straight into the object store.
+_NO_DATA_STATES = frozenset(
+    {"new", "upload", "queued", "running", "setting_metadata", "paused", "deferred", "discarded"}
+)
 
 
 class GalaxyFileSystem(AbstractFileSystem):
@@ -84,8 +88,6 @@ class GalaxyFileSystem(AbstractFileSystem):
         # Listings live in self.dircache, which honours fsspec's cache options.
         # path -> info dict, carrying the size _open resolved
         self._info_cache: dict[str, dict] = {}
-        # library_id -> (flat_contents, timestamp), so one library tree is fetched once per listing
-        self._library_flat_cache: dict[str, tuple[list[dict], float]] = {}
 
     # ------------------------------------------------------------------ #
     # Public fsspec API
@@ -129,25 +131,12 @@ class GalaxyFileSystem(AbstractFileSystem):
 
     def _timestamp(self, path: str, key: str) -> dt.datetime:
         value = self._info(path).get(key)
-        if not value:
+        if value is None:
             raise GalaxyApiError(f"Galaxy reported no {key} for {path!r}")
-        text = str(value)
-        # Python 3.10's fromisoformat rejects a trailing "Z", which Galaxy emits
-        # whenever its timestamps are serialised as timezone-aware.
-        if text[-1:] in ("Z", "z"):
-            text = f"{text[:-1]}+00:00"
-        try:
-            parsed = dt.datetime.fromisoformat(text)
-        except ValueError as exc:
-            raise GalaxyApiError(
-                f"Galaxy reported an unparsable {key} for {path!r}: {value!r}"
-            ) from exc
-        # Galaxy records these in UTC and serialises them without an offset, so
-        # a naive value is UTC. Returning it aware is what fsspec callers expect
-        # and is the difference between comparing against now() and a TypeError.
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=dt.timezone.utc)
-        return parsed
+        seconds = _as_epoch(value)
+        if seconds is None:
+            raise GalaxyApiError(f"Galaxy reported an unparsable {key} for {path!r}: {value!r}")
+        return dt.datetime.fromtimestamp(seconds, tz=dt.timezone.utc)
 
     def _info(self, path: str, **kwargs: Any) -> dict:
         path = self._strip_protocol(path)
@@ -170,8 +159,8 @@ class GalaxyFileSystem(AbstractFileSystem):
                 # Enrich history folders with timestamps on demand.
                 if parent == HISTORIES_DIR and entry.get("created") is None:
                     hist = self.gi.histories.show_history(entry["history_id"], contents=False)
-                    entry["created"] = hist.get("create_time")
-                    entry["mtime"] = hist.get("update_time")
+                    entry["created"] = _as_epoch(hist.get("create_time"))
+                    entry["mtime"] = _as_epoch(hist.get("update_time"))
                 return entry
         raise NotFoundError(path)
 
@@ -189,6 +178,8 @@ class GalaxyFileSystem(AbstractFileSystem):
         info = self._info(path)
         if info["type"] != "file":
             raise IsADirectoryError(path)
+        if info.get("state") in _NO_DATA_STATES:
+            raise GalaxyApiError(f"{path!r} has no data to read yet (state {info['state']!r})")
         # A listed size of 0 means empty or not known; the details say which.
         if info.get("size", 0) == 0:
             if "library_dataset_id" in info:
@@ -321,7 +312,6 @@ class GalaxyFileSystem(AbstractFileSystem):
         if path is None:
             self.dircache.clear()
             self._info_cache.clear()
-            self._library_flat_cache.clear()
             return
         # "at or under given path", per the base class contract.
         prefix = self._strip_protocol(path)
@@ -329,17 +319,10 @@ class GalaxyFileSystem(AbstractFileSystem):
             del self.dircache[cached]
         for cached in [p for p in self._info_cache if p == prefix or p.startswith(f"{prefix}/")]:
             del self._info_cache[cached]
-        # A library's flat contents are keyed by library id rather than by path, and one listing
-        # under the given path may have come from any of them, so they all go.
-        self._library_flat_cache.clear()
 
     def _cache_ok(self) -> bool:
         """Whether the caches that are not ``dircache`` may answer at all."""
         return bool(self.dircache.use_listings_cache)
-
-    def _cache_expired(self, stamped_at: float) -> bool:
-        expiry = self.dircache.listings_expiry_time
-        return expiry is not None and (time.time() - stamped_at) >= expiry
 
     def _list(self, path: str) -> list[dict]:
         if path == ROOT:
@@ -391,8 +374,7 @@ class GalaxyFileSystem(AbstractFileSystem):
                     "type": "directory",
                     "history_id": h["id"],
                     "hid": None,
-                    "created": h.get("create_time"),
-                    "mtime": h.get("update_time"),
+                    **_timestamp_keys(h.get("create_time"), h.get("update_time")),
                 }
             )
         return entries
@@ -507,15 +489,17 @@ class GalaxyFileSystem(AbstractFileSystem):
         raise NotFoundError(path)
 
     def _folder_entries(self, children: list[dict], library: dict, path: str) -> list[dict]:
-        """Turn one folder's contents into fsspec entries.
+        """Turn one folder's contents into fsspec entries, one unique path each.
 
-        Uploading the same file twice gives one folder two datasets with the same name, and Galaxy
-        also permits a dataset named like a sibling folder. Either way they would share a path: one
-        becomes unreachable and the other is served twice. Names are deduplicated across every
-        child so a file can see a folder it clashes with, but folders keep the plain name, because
-        descending rebuilds the path from the displayed folder names and a renamed one could not
-        then be entered.
+        A file is deduplicated against every child, a folder only against other folders, which is
+        the name _match_folder_child resolves.
         """
+        folder_names = {
+            id(child): display
+            for display, child in dedupe_names(
+                [c for c in children if c.get("type") == "folder"], numbered=False
+            )
+        }
         deduped = iter(
             display
             for display, _ in dedupe_names(
@@ -527,18 +511,18 @@ class GalaxyFileSystem(AbstractFileSystem):
         for child in children:
             is_folder = child.get("type") == "folder"
             candidate = next(deduped)
-            display = sanitize_segment(child.get("name") or "") if is_folder else candidate
+            display = folder_names[id(child)] if is_folder else candidate
             entry: dict = {
                 "name": f"{path}/{display}",
                 "type": "directory" if is_folder else "file",
                 # raw_size, never file_size: that one is a human readable string from nice_size.
                 "size": 0 if is_folder else _to_int(child.get("raw_size")) or 0,
             }
-            created = child.get("create_time")
-            changed = child.get("update_time")
-            if created:
+            created = _as_epoch(child.get("create_time"))
+            changed = _as_epoch(child.get("update_time"))
+            if created is not None:
                 entry["created"] = created
-            if changed:
+            if changed is not None:
                 entry["mtime"] = changed
             if is_folder:
                 entry["library_folder_id"] = child["id"]
@@ -547,6 +531,7 @@ class GalaxyFileSystem(AbstractFileSystem):
                 entry["library_id"] = library["id"]
                 if child.get("ldda_id"):
                     entry["ldda_id"] = child["ldda_id"]
+                entry["state"] = child.get("state")
             entries.append(entry)
         return entries
 
@@ -583,10 +568,12 @@ class GalaxyFileSystem(AbstractFileSystem):
             # The listing carries these already, no detail request needed for them. Galaxy's own
             # fsspec file source reads mtime and never last_modified, so an entry without it shows
             # no date at all in the file browser.
-            if item.get("create_time"):
-                entry["created"] = item["create_time"]
-            if item.get("update_time"):
-                entry["mtime"] = item["update_time"]
+            created = _as_epoch(item.get("create_time"))
+            changed = _as_epoch(item.get("update_time"))
+            if created is not None:
+                entry["created"] = created
+            if changed is not None:
+                entry["mtime"] = changed
             if is_collection:
                 entry["size"] = 0
                 entry["collection_id"] = item["id"]
@@ -710,6 +697,7 @@ class GalaxyFileSystem(AbstractFileSystem):
             else:
                 entry["size"] = _to_int(inner.get("file_size") or inner.get("size")) or 0
                 entry["dataset_id"] = inner.get("id")
+                entry["state"] = inner.get("state")
             entries.append(entry)
         return entries
 
@@ -726,12 +714,18 @@ class GalaxyFileSystem(AbstractFileSystem):
         Uses HTTP streaming: for partial-content responses (206) we read only
         the requested chunk; if the server ignores the Range header (200) we
         stream-discard the first ``start`` bytes then read the needed slice.
+
+        ``raw`` asks for the stored file; rendering one fails for library datasets.
         """
         if end <= start:
             return b""
-        url = f"{self._url}/api/datasets/{urllib.parse.quote(dataset_id)}/display"
+        query = {"raw": "true"}
         if hda_ldda != "hda":
-            url += f"?hda_ldda={hda_ldda}"
+            query["hda_ldda"] = hda_ldda
+        url = (
+            f"{self._url}/api/datasets/{urllib.parse.quote(dataset_id)}/display"
+            f"?{urllib.parse.urlencode(query)}"
+        )
         return self._download_from_url(url, start, end, dataset_id)
 
     def _is_galaxy_origin(self, url: str) -> bool:
@@ -798,7 +792,12 @@ class GalaxyFileSystem(AbstractFileSystem):
                 return _skip_then_read_stream(resp, start, length)
             if resp.status_code in (401, 403):
                 raise ReadOnlyError(f"Galaxy refused dataset access: {resp.status_code}")
-            raise NotFoundError(f"dataset {label} (HTTP {resp.status_code})")
+            if resp.status_code == 404:
+                raise NotFoundError(f"dataset {label} (HTTP 404)")
+            # Anything else is Galaxy failing, not the dataset missing.
+            raise GalaxyApiError(
+                f"Galaxy could not serve dataset {label} (HTTP {resp.status_code})"
+            )
         finally:
             resp.close()
 
@@ -820,6 +819,44 @@ def _as_requests_will_fetch(url: str) -> str:
     if not prepared.url:
         raise GalaxyApiError(f"refusing to fetch an unparsable URL {url!r}")
     return str(prepared.url)
+
+
+def _timestamp_keys(created: object, changed: object) -> dict[str, float]:
+    """The timestamp keys an entry should carry, leaving out the ones Galaxy did not send."""
+    keys: dict[str, float] = {}
+    born = _as_epoch(created)
+    touched = _as_epoch(changed)
+    if born is not None:
+        keys["created"] = born
+    if touched is not None:
+        keys["mtime"] = touched
+    return keys
+
+
+def _as_epoch(value: object) -> float | None:
+    """Turn a Galaxy timestamp into seconds since the epoch, or None.
+
+    A number, as fsspec's LocalFileSystem uses: Galaxy's file source cannot format a string.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    # Python 3.10's fromisoformat rejects a trailing "Z", which Galaxy emits whenever its
+    # timestamps are serialised as timezone aware.
+    if text[-1:] in ("Z", "z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        moment = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    # Galaxy records these in UTC and serialises them without an offset, so a naive value is UTC.
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=dt.timezone.utc)
+    return moment.timestamp()
 
 
 def _origin(url: str) -> tuple[str, str, int | None]:
