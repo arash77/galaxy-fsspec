@@ -29,7 +29,16 @@ class FakeHistories:
     #: default listing carries create_time and update_time but never file_size.
     _DETAIL_ONLY = ("file_size", "elements")
 
-    def show_history(self, history_id, contents=True, details=None, keys=None):
+    def show_history(
+        self,
+        history_id,
+        contents=False,
+        deleted=None,
+        visible=None,
+        details=None,
+        types=None,
+        keys=None,
+    ):
         hist = next(h for h in self.store["histories"] if h["id"] == history_id)
         if not contents:
             return {
@@ -43,6 +52,10 @@ class FakeHistories:
         )
         items = []
         for item in hist["contents"]:
+            if deleted is not None and item.get("deleted", False) != deleted:
+                continue
+            if visible is not None and item.get("visible", True) != visible:
+                continue
             if wants_detail:
                 items.append(dict(item))
                 continue
@@ -519,6 +532,26 @@ class TestHistoryContents:
         names = fs.ls("histories/History A", detail=False)
         assert "histories/History A/my-uploaded-dataset" in names
         assert "histories/History A/my result" in names
+
+    def test_deleted_and_hidden_datasets_are_left_out(self):
+        """Galaxy hides a copy of every file put into a collection, so each showed up twice."""
+        store = _store()
+        store["histories"][0]["contents"] += [
+            {
+                "id": "gone",
+                "name": "deleted-draft",
+                "history_content_type": "dataset",
+                "deleted": True,
+            },
+            {
+                "id": "copy",
+                "name": "hidden-copy",
+                "history_content_type": "dataset",
+                "visible": False,
+            },
+        ]
+        names = make_fs(store).ls("histories/History A", detail=False)
+        assert names == ["histories/History A/my-uploaded-dataset", "histories/History A/my result"]
 
     def test_dataset_info(self, fs):
         info = fs.info("histories/History A/my-uploaded-dataset")

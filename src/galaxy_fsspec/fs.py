@@ -544,10 +544,18 @@ class GalaxyFileSystem(AbstractFileSystem):
     _CONTENTS_DETAILS = "all"
 
     def _history_contents(self, history_id: str) -> list[dict]:
-        """Return a history's contents, with sizes, in one request."""
+        """Return what the history panel shows, with sizes, in one request.
+
+        Without the filters Galaxy also returns deleted datasets, and the hidden copies it
+        makes of every file put into a collection, which then appeared twice.
+        """
         return list(
             self.gi.histories.show_history(
-                history_id, contents=True, details=self._CONTENTS_DETAILS
+                history_id,
+                contents=True,
+                deleted=False,
+                visible=True,
+                details=self._CONTENTS_DETAILS,
             )
         )
 
